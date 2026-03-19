@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -29,7 +30,10 @@ func (d *DDLBuilder) AutoMigrate(ctx context.Context, meta *TableMeta) error {
 	if err := d.createTableIfNotExists(ctx, meta); err != nil {
 		return err
 	}
-	return d.addMissingColumns(ctx, meta)
+	if err := d.addMissingColumns(ctx, meta); err != nil {
+		return err
+	}
+	return d.ensureIndexes(ctx, meta)
 }
 
 func (d *DDLBuilder) createTableIfNotExists(ctx context.Context, meta *TableMeta) error {
@@ -47,6 +51,7 @@ func (d *DDLBuilder) createTableIfNotExists(ctx context.Context, meta *TableMeta
 	if pkCol != "" {
 		colDefs = append(colDefs, fmt.Sprintf("PRIMARY KEY (`%s`)", pkCol))
 		colDefs = append(colDefs, builtInIndexDefs()...)
+		colDefs = append(colDefs, userIndexDefs(meta)...)
 	}
 
 	ddl := fmt.Sprintf(
@@ -121,12 +126,147 @@ func builtInIndexDefs() []string {
 	}
 }
 
+func builtInIndexSet() map[string]struct{} {
+	return map[string]struct{}{
+		"PRIMARY":         {},
+		"idx_is_deleted":  {},
+		"idx_update_time": {},
+	}
+}
+
 func builtInColumnAddDefs() map[string]string {
 	return map[string]string{
 		"is_deleted":  "`is_deleted` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '软删除标记：0-正常 1-已删除'",
 		"create_time": "`create_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
 		"update_time": "`update_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
 	}
+}
+
+// collectUserIndexes 将字段上的 index tag 合并为索引名 -> 列名列表的 map。
+// 匿名索引（index tag 为 ""）自动生成索引名 idx_{colName}。
+func collectUserIndexes(meta *TableMeta) map[string][]string {
+	indexes := make(map[string][]string)
+	for _, f := range meta.Fields {
+		for _, idxName := range f.Indexes {
+			if idxName == "" {
+				idxName = "idx_" + f.ColName
+			}
+			indexes[idxName] = append(indexes[idxName], f.ColName)
+		}
+	}
+	return indexes
+}
+
+// userIndexDefs 返回建表 DDL 中用户自定义索引的 INDEX 定义字符串列表。
+func userIndexDefs(meta *TableMeta) []string {
+	idxMap := collectUserIndexes(meta)
+	defs := make([]string, 0, len(idxMap))
+	for name, cols := range idxMap {
+		quoted := make([]string, len(cols))
+		for i, c := range cols {
+			quoted[i] = "`" + c + "`"
+		}
+		defs = append(defs, fmt.Sprintf("INDEX `%s` (%s)", name, strings.Join(quoted, ",")))
+	}
+	return defs
+}
+
+// ensureIndexes 将数据库中的用户索引与 struct tag 声明对齐：
+// - 声明新增：创建索引
+// - 声明删除：删除索引
+// - 同名索引列变化：先删后建
+func (d *DDLBuilder) ensureIndexes(ctx context.Context, meta *TableMeta) error {
+	desired := collectUserIndexes(meta)
+	existing, err := d.queryExistingUserIndexes(ctx, meta.TableName)
+	if err != nil {
+		return err
+	}
+	toDrop, toCreate := planUserIndexChanges(existing, desired)
+
+	for _, name := range toDrop {
+		sql := fmt.Sprintf("DROP INDEX `%s` ON `%s`", name, meta.TableName)
+		if _, err = d.db.ExecContext(ctx, sql); err != nil {
+			return fmt.Errorf("ensureIndexes drop [%s.%s]: %w", meta.TableName, name, err)
+		}
+	}
+
+	for name, cols := range toCreate {
+		quoted := make([]string, len(cols))
+		for i, c := range cols {
+			quoted[i] = "`" + c + "`"
+		}
+		sql := fmt.Sprintf("CREATE INDEX `%s` ON `%s` (%s)",
+			name, meta.TableName, strings.Join(quoted, ","))
+		if _, err = d.db.ExecContext(ctx, sql); err != nil {
+			return fmt.Errorf("ensureIndexes [%s.%s]: %w", meta.TableName, name, err)
+		}
+	}
+	return nil
+}
+
+func planUserIndexChanges(existing map[string][]string, desired map[string][]string) ([]string, map[string][]string) {
+	toDrop := make([]string, 0)
+	toCreate := make(map[string][]string)
+
+	for name, cols := range existing {
+		target, ok := desired[name]
+		if !ok {
+			toDrop = append(toDrop, name)
+			continue
+		}
+		if !sameColumns(cols, target) {
+			toDrop = append(toDrop, name)
+			toCreate[name] = target
+		}
+	}
+
+	for name, cols := range desired {
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		toCreate[name] = cols
+	}
+
+	sort.Strings(toDrop)
+	return toDrop, toCreate
+}
+
+func sameColumns(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (d *DDLBuilder) queryExistingUserIndexes(ctx context.Context, tableName string) (map[string][]string, error) {
+	rows, err := d.db.QueryContext(ctx,
+		"SELECT INDEX_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+		tableName,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	builtIn := builtInIndexSet()
+	existing := make(map[string][]string)
+	for rows.Next() {
+		var name string
+		var column string
+		if err = rows.Scan(&name, &column); err != nil {
+			return nil, err
+		}
+		if _, skip := builtIn[name]; skip {
+			continue
+		}
+		existing[name] = append(existing[name], column)
+	}
+	return existing, rows.Err()
 }
 
 // buildColumnDef 将 FieldMeta 转换为 SQL 列定义片段。

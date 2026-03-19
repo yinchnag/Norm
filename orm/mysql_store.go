@@ -188,15 +188,21 @@ func (s *MySQLStore) flush(q *flushQueue) {
 	if len(items) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
 	for _, item := range items {
-		if item.deleted {
-			s.execSoftDelete(ctx, item)
-		} else {
-			s.execUpsert(ctx, item)
-		}
+		s.execItem(item)
+	}
+}
+
+// execItem 为单条 item 独立分配 5s context 并执行 SQL，
+// 单次写操作超时不影响同批次其他条目。
+func (s *MySQLStore) execItem(item *pendingItem) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if item.deleted {
+		s.execSoftDelete(ctx, item)
+	} else {
+		s.execUpsert(ctx, item)
 	}
 }
 

@@ -93,3 +93,65 @@ func TestBuiltInColumnDefs(t *testing.T) {
 		t.Error("built-in defs should contain update_time")
 	}
 }
+
+func TestPlanUserIndexChangesDropAndCreate(t *testing.T) {
+	existing := map[string][]string{
+		"idx_level_score": {"level", "score"},
+	}
+	desired := map[string][]string{
+		"idx_score": {"score"},
+	}
+
+	toDrop, toCreate := planUserIndexChanges(existing, desired)
+
+	if len(toDrop) != 1 || toDrop[0] != "idx_level_score" {
+		t.Fatalf("unexpected toDrop: %+v", toDrop)
+	}
+	cols, ok := toCreate["idx_score"]
+	if !ok {
+		t.Fatal("idx_score should be created")
+	}
+	if len(cols) != 1 || cols[0] != "score" {
+		t.Fatalf("unexpected idx_score cols: %+v", cols)
+	}
+}
+
+func TestPlanUserIndexChangesRecreateWhenColumnChanged(t *testing.T) {
+	existing := map[string][]string{
+		"idx_a": {"a", "b"},
+	}
+	desired := map[string][]string{
+		"idx_a": {"b", "a"},
+	}
+
+	toDrop, toCreate := planUserIndexChanges(existing, desired)
+
+	if len(toDrop) != 1 || toDrop[0] != "idx_a" {
+		t.Fatalf("unexpected toDrop: %+v", toDrop)
+	}
+	cols, ok := toCreate["idx_a"]
+	if !ok {
+		t.Fatal("idx_a should be recreated")
+	}
+	if len(cols) != 2 || cols[0] != "b" || cols[1] != "a" {
+		t.Fatalf("unexpected recreated idx_a cols: %+v", cols)
+	}
+}
+
+func TestPlanUserIndexChangesNoChange(t *testing.T) {
+	existing := map[string][]string{
+		"idx_score": {"score"},
+	}
+	desired := map[string][]string{
+		"idx_score": {"score"},
+	}
+
+	toDrop, toCreate := planUserIndexChanges(existing, desired)
+
+	if len(toDrop) != 0 {
+		t.Fatalf("expected no drop, got %+v", toDrop)
+	}
+	if len(toCreate) != 0 {
+		t.Fatalf("expected no create, got %+v", toCreate)
+	}
+}

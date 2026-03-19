@@ -13,15 +13,16 @@ import (
 // 使用 unsafe.Offsetof 直接持有字段相对于结构体基址的偏移，
 // 后续通过指针运算直接读写字段值，避免 reflect.Value 带来的分配与装箱开销。
 type FieldMeta struct {
-	GoName    string        // Go 字段名
-	ColName   string        // 数据库列名
-	Comment   string        // 列注释
-	GoType    reflect.Type  // 字段 reflect.Type
-	Offset    uintptr       // 字段在结构体内的字节偏移
-	IsPrimary bool          // 是否是主键
-	IsAutoInc bool          // 主键是否自增
-	NotNull   bool          // 是否 NOT NULL
-	Length    int           // 字符串列长度，0 表示不限
+	GoName    string       // Go 字段名
+	ColName   string       // 数据库列名
+	Comment   string       // 列注释
+	GoType    reflect.Type // 字段 reflect.Type
+	Offset    uintptr      // 字段在结构体内的字节偏移
+	IsPrimary bool         // 是否是主键
+	IsAutoInc bool         // 主键是否自增
+	NotNull   bool         // 是否 NOT NULL
+	Length    int          // 字符串列长度，0 表示不限
+	Indexes   []string     // 所属索引名列表（空 = 不建索引；多个值表示参与多个索引）
 }
 
 // TableMeta 描述一张表的全部字段元数据，使用 sync.Map 做类型级缓存以实现无锁读。
@@ -106,6 +107,13 @@ func parseFieldMeta(f reflect.StructField, tag string) *FieldMeta {
 		case strings.HasPrefix(p, "length:"):
 			n, _ := strconv.Atoi(strings.TrimPrefix(p, "length:"))
 			fm.Length = n
+		case p == "index":
+			// 匿名索引：自动生成索引名 idx_{colName}
+			fm.Indexes = append(fm.Indexes, "")
+		case strings.HasPrefix(p, "index:"):
+			// 命名索引：index:idx_level_score
+			name := strings.TrimPrefix(p, "index:")
+			fm.Indexes = append(fm.Indexes, name)
 		}
 	}
 	return fm
