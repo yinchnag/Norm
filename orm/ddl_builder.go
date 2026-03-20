@@ -9,9 +9,6 @@ import (
 	"strings"
 )
 
-// DDLBuilder 根据 TableMeta 生成建表 DDL 并执行 AUTO MIGRATE。
-// 策略：CREATE TABLE IF NOT EXISTS，再通过 INFORMATION_SCHEMA 补全缺失列（ADD COLUMN）。
-// 生产环境建议在灰度期用 dry-run 模式先预览 SQL。
 type DDLBuilder struct {
 	db *sql.DB
 }
@@ -26,17 +23,17 @@ func newDDLBuilderWithDB(db *sql.DB) *DDLBuilder {
 
 // AutoMigrate 确保表存在且所有字段列存在。
 // 不会删除旧列，不会修改列类型（安全迁移原则）。
-func (d *DDLBuilder) AutoMigrate(ctx context.Context, meta *TableMeta) error {
-	if err := d.createTableIfNotExists(ctx, meta); err != nil {
+func (that *DDLBuilder) AutoMigrate(ctx context.Context, meta *TableMeta) error {
+	if err := that.createTableIfNotExists(ctx, meta); err != nil {
 		return err
 	}
-	if err := d.addMissingColumns(ctx, meta); err != nil {
+	if err := that.addMissingColumns(ctx, meta); err != nil {
 		return err
 	}
-	return d.ensureIndexes(ctx, meta)
+	return that.ensureIndexes(ctx, meta)
 }
 
-func (d *DDLBuilder) createTableIfNotExists(ctx context.Context, meta *TableMeta) error {
+func (that *DDLBuilder) createTableIfNotExists(ctx context.Context, meta *TableMeta) error {
 	colDefs := make([]string, 0, len(meta.Fields)+2)
 	var pkCol string
 
@@ -59,13 +56,13 @@ func (d *DDLBuilder) createTableIfNotExists(ctx context.Context, meta *TableMeta
 		meta.TableName,
 		strings.Join(colDefs, ",\n  "),
 	)
-	_, err := d.db.ExecContext(ctx, ddl)
+	_, err := that.db.ExecContext(ctx, ddl)
 	return err
 }
 
 // addMissingColumns 使用 INFORMATION_SCHEMA 检查并补全缺失列。
-func (d *DDLBuilder) addMissingColumns(ctx context.Context, meta *TableMeta) error {
-	rows, err := d.db.QueryContext(ctx,
+func (that *DDLBuilder) addMissingColumns(ctx context.Context, meta *TableMeta) error {
+	rows, err := that.db.QueryContext(ctx,
 		"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
 		meta.TableName,
 	)
@@ -94,7 +91,7 @@ func (d *DDLBuilder) addMissingColumns(ctx context.Context, meta *TableMeta) err
 			"ALTER TABLE `%s` ADD COLUMN %s",
 			meta.TableName, buildColumnDef(f),
 		)
-		if _, err = d.db.ExecContext(ctx, alterSQL); err != nil {
+		if _, err = that.db.ExecContext(ctx, alterSQL); err != nil {
 			return fmt.Errorf("addMissingColumns [%s.%s]: %w", meta.TableName, f.ColName, err)
 		}
 	}
@@ -104,7 +101,7 @@ func (d *DDLBuilder) addMissingColumns(ctx context.Context, meta *TableMeta) err
 			continue
 		}
 		alterSQL := fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN %s", meta.TableName, def)
-		if _, err = d.db.ExecContext(ctx, alterSQL); err != nil {
+		if _, err = that.db.ExecContext(ctx, alterSQL); err != nil {
 			return fmt.Errorf("addMissingColumns [%s.%s]: %w", meta.TableName, col, err)
 		}
 	}
@@ -175,9 +172,9 @@ func userIndexDefs(meta *TableMeta) []string {
 // - 声明新增：创建索引
 // - 声明删除：删除索引
 // - 同名索引列变化：先删后建
-func (d *DDLBuilder) ensureIndexes(ctx context.Context, meta *TableMeta) error {
+func (that *DDLBuilder) ensureIndexes(ctx context.Context, meta *TableMeta) error {
 	desired := collectUserIndexes(meta)
-	existing, err := d.queryExistingUserIndexes(ctx, meta.TableName)
+	existing, err := that.queryExistingUserIndexes(ctx, meta.TableName)
 	if err != nil {
 		return err
 	}
@@ -185,7 +182,7 @@ func (d *DDLBuilder) ensureIndexes(ctx context.Context, meta *TableMeta) error {
 
 	for _, name := range toDrop {
 		sql := fmt.Sprintf("DROP INDEX `%s` ON `%s`", name, meta.TableName)
-		if _, err = d.db.ExecContext(ctx, sql); err != nil {
+		if _, err = that.db.ExecContext(ctx, sql); err != nil {
 			return fmt.Errorf("ensureIndexes drop [%s.%s]: %w", meta.TableName, name, err)
 		}
 	}
@@ -197,7 +194,7 @@ func (d *DDLBuilder) ensureIndexes(ctx context.Context, meta *TableMeta) error {
 		}
 		sql := fmt.Sprintf("CREATE INDEX `%s` ON `%s` (%s)",
 			name, meta.TableName, strings.Join(quoted, ","))
-		if _, err = d.db.ExecContext(ctx, sql); err != nil {
+		if _, err = that.db.ExecContext(ctx, sql); err != nil {
 			return fmt.Errorf("ensureIndexes [%s.%s]: %w", meta.TableName, name, err)
 		}
 	}
@@ -243,8 +240,8 @@ func sameColumns(a []string, b []string) bool {
 	return true
 }
 
-func (d *DDLBuilder) queryExistingUserIndexes(ctx context.Context, tableName string) (map[string][]string, error) {
-	rows, err := d.db.QueryContext(ctx,
+func (that *DDLBuilder) queryExistingUserIndexes(ctx context.Context, tableName string) (map[string][]string, error) {
+	rows, err := that.db.QueryContext(ctx,
 		"SELECT INDEX_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
 		tableName,
 	)

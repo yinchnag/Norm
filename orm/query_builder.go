@@ -40,46 +40,46 @@ func NewQueryBuilderWithDB[T any](meta *TableMeta, db DBExecutor) *QueryBuilder[
 
 // Where 设置 WHERE 子句（不含 "WHERE" 关键字），
 // 框架自动追加 `is_deleted=0` 以过滤软删除记录。
-func (q *QueryBuilder[T]) Where(cond string) *QueryBuilder[T] {
-	q.where = cond
-	return q
+func (that *QueryBuilder[T]) Where(cond string) *QueryBuilder[T] {
+	that.where = cond
+	return that
 }
 
 // OrderBy 设置 ORDER BY 子句（不含 "ORDER BY" 关键字）。
-func (q *QueryBuilder[T]) OrderBy(expr string) *QueryBuilder[T] {
-	q.orderBy = expr
-	return q
+func (that *QueryBuilder[T]) OrderBy(expr string) *QueryBuilder[T] {
+	that.orderBy = expr
+	return that
 }
 
 // Limit 设置最大返回行数。
-func (q *QueryBuilder[T]) Limit(n int) *QueryBuilder[T] {
-	q.limit = n
-	return q
+func (that *QueryBuilder[T]) Limit(n int) *QueryBuilder[T] {
+	that.limit = n
+	return that
 }
 
 // FindAll 执行查询并返回结果切片。
 // 直接通过 unsafe 指针将列值写入结构体字段，避免 reflect.Value.Set 带来的隐式分配。
-func (q *QueryBuilder[T]) FindAll(ctx context.Context) ([]T, error) {
-	cols := make([]string, len(q.meta.Fields))
-	for i, f := range q.meta.Fields {
+func (that *QueryBuilder[T]) FindAll(ctx context.Context) ([]T, error) {
+	cols := make([]string, len(that.meta.Fields))
+	for i, f := range that.meta.Fields {
 		cols[i] = fmt.Sprintf("`%s`", f.ColName)
 	}
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "SELECT %s FROM `%s` WHERE (`is_deleted`=0)",
-		strings.Join(cols, ","), q.meta.TableName)
+		strings.Join(cols, ","), that.meta.TableName)
 
-	if q.where != "" {
-		fmt.Fprintf(&sb, " AND (%s)", q.where)
+	if that.where != "" {
+		fmt.Fprintf(&sb, " AND (%s)", that.where)
 	}
-	if q.orderBy != "" {
-		fmt.Fprintf(&sb, " ORDER BY %s", q.orderBy)
+	if that.orderBy != "" {
+		fmt.Fprintf(&sb, " ORDER BY %s", that.orderBy)
 	}
-	if q.limit > 0 {
-		fmt.Fprintf(&sb, " LIMIT %d", q.limit)
+	if that.limit > 0 {
+		fmt.Fprintf(&sb, " LIMIT %d", that.limit)
 	}
 
-	rows, err := q.db.QueryContext(ctx, sb.String())
+	rows, err := that.db.QueryContext(ctx, sb.String())
 	if err != nil {
 		return nil, fmt.Errorf("FindAll query: %w", err)
 	}
@@ -100,12 +100,12 @@ func (q *QueryBuilder[T]) FindAll(ctx context.Context) ([]T, error) {
 		objPtr := reflect.New(elemType)
 		base := objPtr.UnsafePointer()
 
-		scanDest, scanTargets := makeScanDest(q.meta, base)
+		scanDest, scanTargets := makeScanDest(that.meta, base)
 		if err = rows.Scan(scanDest...); err != nil {
 			return nil, fmt.Errorf("FindAll scan: %w", err)
 		}
 		// 将扫描结果从 sql.Null* 缓冲回写到原字段
-		writeScanResultsToFields(q.meta, base, scanTargets)
+		writeScanResultsToFields(that.meta, base, scanTargets)
 		results = append(results, objPtr.Interface().(T))
 	}
 	return results, rows.Err()

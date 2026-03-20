@@ -41,7 +41,7 @@ func redisKey(tableName string, pk any) string {
 }
 
 // Set 将对象按字段写入 Redis Hash，TTL 从全局配置读取。
-func (r *RedisStore) Set(ctx context.Context, tableName string, pk any, obj any) error {
+func (that *RedisStore) Set(ctx context.Context, tableName string, pk any, obj any) error {
 	meta := GetTableMeta(reflect.TypeOf(obj))
 	base := pointerOf(obj)
 	fields, err := buildRedisHashFields(meta, base)
@@ -50,9 +50,9 @@ func (r *RedisStore) Set(ctx context.Context, tableName string, pk any, obj any)
 	}
 
 	key := redisKey(tableName, pk)
-	rcfg := r.pool.SelectRedisConfig(r.useGlobal)
+	rcfg := that.pool.SelectRedisConfig(that.useGlobal)
 	ttl := time.Duration(rcfg.KeyTTLSec) * time.Second
-	client := r.pool.SelectRedis(r.useGlobal)
+	client := that.pool.SelectRedis(that.useGlobal)
 	pipe := client.TxPipeline()
 	pipe.HSet(ctx, key, fields)
 	pipe.Expire(ctx, key, ttl)
@@ -61,9 +61,9 @@ func (r *RedisStore) Set(ctx context.Context, tableName string, pk any, obj any)
 }
 
 // Get 从 Redis Hash 读取对象；key 不存在时返回 goredis.Nil。
-func (r *RedisStore) Get(ctx context.Context, tableName string, pk any, dest any) error {
+func (that *RedisStore) Get(ctx context.Context, tableName string, pk any, dest any) error {
 	key := redisKey(tableName, pk)
-	vals, err := r.pool.SelectRedis(r.useGlobal).HGetAll(ctx, key).Result()
+	vals, err := that.pool.SelectRedis(that.useGlobal).HGetAll(ctx, key).Result()
 	if err != nil {
 		return err // 包含 goredis.Nil
 	}
@@ -80,8 +80,8 @@ func (r *RedisStore) Get(ctx context.Context, tableName string, pk any, dest any
 }
 
 // Del 从 Redis 删除对象缓存。
-func (r *RedisStore) Del(ctx context.Context, tableName string, pk any) error {
-	return r.pool.SelectRedis(r.useGlobal).Del(ctx, redisKey(tableName, pk)).Err()
+func (that *RedisStore) Del(ctx context.Context, tableName string, pk any) error {
+	return that.pool.SelectRedis(that.useGlobal).Del(ctx, redisKey(tableName, pk)).Err()
 }
 
 func buildRedisHashFields(meta *TableMeta, base unsafe.Pointer) (map[string]interface{}, error) {
@@ -114,8 +114,8 @@ func applyRedisHashFields(meta *TableMeta, base unsafe.Pointer, values map[strin
 }
 
 // SetRaw 直接写入 JSON bytes，供批量刷盘使用，避免二次序列化。
-func (r *RedisStore) SetRaw(ctx context.Context, key string, data []byte, ttl time.Duration) error {
-	return r.pool.SelectRedis(r.useGlobal).Set(ctx, key, data, ttl).Err()
+func (that *RedisStore) SetRaw(ctx context.Context, key string, data []byte, ttl time.Duration) error {
+	return that.pool.SelectRedis(that.useGlobal).Set(ctx, key, data, ttl).Err()
 }
 
 // IsNotFound 判断 Redis 错误是否为 key 不存在。

@@ -82,25 +82,25 @@ func openRedis(cfg *config.RedisConfig) *goredis.Client {
 	})
 }
 
-func (p *Pool) SelectMySQL(useGlobal bool) *sql.DB {
-	if useGlobal && p.GlobalDB != nil {
-		return p.GlobalDB
+func (that *Pool) SelectMySQL(useGlobal bool) *sql.DB {
+	if useGlobal && that.GlobalDB != nil {
+		return that.GlobalDB
 	}
-	return p.DB
+	return that.DB
 }
 
-func (p *Pool) SelectRedis(useGlobal bool) *goredis.Client {
-	if useGlobal && p.GlobalRedis != nil {
-		return p.GlobalRedis
+func (that *Pool) SelectRedis(useGlobal bool) *goredis.Client {
+	if useGlobal && that.GlobalRedis != nil {
+		return that.GlobalRedis
 	}
-	return p.Redis
+	return that.Redis
 }
 
-func (p *Pool) SelectRedisConfig(useGlobal bool) *config.RedisConfig {
-	if useGlobal && p.Cfg != nil && p.Cfg.GlobalRedis != nil {
-		return p.Cfg.GlobalRedis
+func (that *Pool) SelectRedisConfig(useGlobal bool) *config.RedisConfig {
+	if useGlobal && that.Cfg != nil && that.Cfg.GlobalRedis != nil {
+		return that.Cfg.GlobalRedis
 	}
-	return &p.Cfg.Redis
+	return &that.Cfg.Redis
 }
 
 // GetPool 返回全局连接池，未初始化时 panic（开发期快速失败）。

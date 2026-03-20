@@ -32,20 +32,20 @@ func newFlushQueue() *flushQueue {
 	return &flushQueue{items: make(map[string]*pendingItem, 64)}
 }
 
-func (q *flushQueue) push(item *pendingItem) {
-	q.mu.Lock()
-	q.items[item.key] = item // 覆盖旧条目——核心去重逻辑
-	q.mu.Unlock()
+func (that *flushQueue) push(item *pendingItem) {
+	that.mu.Lock()
+	that.items[item.key] = item // 覆盖旧条目——核心去重逻辑
+	that.mu.Unlock()
 }
 
-func (q *flushQueue) drain() []*pendingItem {
-	q.mu.Lock()
-	out := make([]*pendingItem, 0, len(q.items))
-	for _, v := range q.items {
+func (that *flushQueue) drain() []*pendingItem {
+	that.mu.Lock()
+	out := make([]*pendingItem, 0, len(that.items))
+	for _, v := range that.items {
 		out = append(out, v)
 	}
-	q.items = make(map[string]*pendingItem, 64)
-	q.mu.Unlock()
+	that.items = make(map[string]*pendingItem, 64)
+	that.mu.Unlock()
 	return out
 }
 
@@ -153,62 +153,62 @@ func getMySQLStoreForRoute(useGlobal bool) *MySQLStore {
 }
 
 // start 启动所有 worker goroutine。
-func (s *MySQLStore) start() {
-	interval := time.Duration(s.pool.Cfg.FlushIntervalMs) * time.Millisecond
-	for i := range s.nWorker {
-		s.wg.Add(1)
-		go s.worker(i, interval)
+func (that *MySQLStore) start() {
+	interval := time.Duration(that.pool.Cfg.FlushIntervalMs) * time.Millisecond
+	for i := range that.nWorker {
+		that.wg.Add(1)
+		go that.worker(i, interval)
 	}
 }
 
 // Stop 优雅停止所有 worker：先关闭信号，再等待最后一次 flush 完成。
-func (s *MySQLStore) Stop() {
-	close(s.stopCh)
-	s.wg.Wait()
+func (that *MySQLStore) Stop() {
+	close(that.stopCh)
+	that.wg.Wait()
 }
 
-func (s *MySQLStore) worker(idx int, interval time.Duration) {
-	defer s.wg.Done()
+func (that *MySQLStore) worker(idx int, interval time.Duration) {
+	defer that.wg.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			s.flush(s.queues[idx])
-		case <-s.stopCh:
-			s.flush(s.queues[idx]) // 关闭前最后一次 flush，防丢档
+			that.flush(that.queues[idx])
+		case <-that.stopCh:
+			that.flush(that.queues[idx]) // 关闭前最后一次 flush，防丢档
 			return
 		}
 	}
 }
 
 // flush 批量执行队列内所有 pendingItem 对应的 SQL。
-func (s *MySQLStore) flush(q *flushQueue) {
+func (that *MySQLStore) flush(q *flushQueue) {
 	items := q.drain()
 	if len(items) == 0 {
 		return
 	}
 
 	for _, item := range items {
-		s.execItem(item)
+		that.execItem(item)
 	}
 }
 
 // execItem 为单条 item 独立分配 5s context 并执行 SQL，
 // 单次写操作超时不影响同批次其他条目。
-func (s *MySQLStore) execItem(item *pendingItem) {
+func (that *MySQLStore) execItem(item *pendingItem) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if item.deleted {
-		s.execSoftDelete(ctx, item)
+		that.execSoftDelete(ctx, item)
 	} else {
-		s.execUpsert(ctx, item)
+		that.execUpsert(ctx, item)
 	}
 }
 
 // execUpsert 执行 INSERT ... ON DUPLICATE KEY UPDATE（自动幂等）。
 // 每次更新都会将 is_deleted 复位为 0，并刷新 update_time。
-func (s *MySQLStore) execUpsert(ctx context.Context, item *pendingItem) {
+func (that *MySQLStore) execUpsert(ctx context.Context, item *pendingItem) {
 	fields := item.meta.Fields
 	cols := make([]string, 0, len(fields)+3)
 	placeholders := make([]string, 0, len(fields)+3)
@@ -239,7 +239,7 @@ func (s *MySQLStore) execUpsert(ctx context.Context, item *pendingItem) {
 		strings.Join(placeholders, ","),
 		strings.Join(updates, ","),
 	)
-	if _, err := s.pool.SelectMySQL(s.useGlobal).ExecContext(ctx, sql, args...); err != nil {
+	if _, err := that.pool.SelectMySQL(that.useGlobal).ExecContext(ctx, sql, args...); err != nil {
 		// 游戏服务器不应因存档失败崩溃；记录错误，等下次 flush 重试
 		// TODO: 接入项目日志组件
 		fmt.Printf("[gameorm] upsert error table=%s pk=%v: %v\n", item.tableName, item.snapshot[indexOf(item.meta)], err)
@@ -247,7 +247,7 @@ func (s *MySQLStore) execUpsert(ctx context.Context, item *pendingItem) {
 }
 
 // execSoftDelete 通过设置 is_deleted=1 实现软删除，同时刷新 update_time。
-func (s *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) {
+func (that *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) {
 	pk := item.meta.PrimaryField
 	pkVal := item.snapshot[pkIndex(item.meta)]
 
@@ -255,20 +255,20 @@ func (s *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) {
 		"UPDATE `%s` SET `is_deleted`=1, `update_time`=NOW() WHERE `%s`=? AND `is_deleted`=0",
 		item.tableName, pk.ColName,
 	)
-	if _, err := s.pool.SelectMySQL(s.useGlobal).ExecContext(ctx, sql, pkVal); err != nil {
+	if _, err := that.pool.SelectMySQL(that.useGlobal).ExecContext(ctx, sql, pkVal); err != nil {
 		fmt.Printf("[gameorm] softDelete error table=%s pk=%v: %v\n", item.tableName, pkVal, err)
 	}
 }
 
 // EnqueueSave 将对象快照入队，不阻塞调用方。
 // workerIdx = hash(pk) % nWorker，保证同一对象始终进同一队列（顺序保证）。
-func (s *MySQLStore) EnqueueSave(tableName string, meta *TableMeta, base unsafe.Pointer) {
+func (that *MySQLStore) EnqueueSave(tableName string, meta *TableMeta, base unsafe.Pointer) {
 	frozenMeta := freezeTableMeta(meta)
 	snap := snapshotFields(frozenMeta, base)
 	pk := snap[pkIndex(frozenMeta)]
 	key := fmt.Sprintf("%s:%v", tableName, pk)
-	idx := hashKey(key) % uint64(s.nWorker)
-	s.queues[idx].push(&pendingItem{
+	idx := hashKey(key) % uint64(that.nWorker)
+	that.queues[idx].push(&pendingItem{
 		key:       key,
 		tableName: tableName,
 		meta:      frozenMeta,
@@ -277,13 +277,13 @@ func (s *MySQLStore) EnqueueSave(tableName string, meta *TableMeta, base unsafe.
 }
 
 // EnqueueDelete 将软删除请求入队。
-func (s *MySQLStore) EnqueueDelete(tableName string, meta *TableMeta, base unsafe.Pointer) {
+func (that *MySQLStore) EnqueueDelete(tableName string, meta *TableMeta, base unsafe.Pointer) {
 	frozenMeta := freezeTableMeta(meta)
 	snap := snapshotFields(frozenMeta, base)
 	pk := snap[pkIndex(frozenMeta)]
 	key := fmt.Sprintf("%s:%v", tableName, pk)
-	idx := hashKey(key) % uint64(s.nWorker)
-	s.queues[idx].push(&pendingItem{
+	idx := hashKey(key) % uint64(that.nWorker)
+	that.queues[idx].push(&pendingItem{
 		key:       key,
 		tableName: tableName,
 		meta:      frozenMeta,

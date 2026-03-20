@@ -125,8 +125,8 @@ func initGlobalTypeOnce(hostType reflect.Type) (*TableMeta, error) {
 //  2. 触发 AutoMigrate（CREATE TABLE IF NOT EXISTS + 补列）
 //
 // 示例：user := &Player{PlayerID: 1001}; user.Init()
-func (s *TableSchema[T]) Init() {
-	s.once.Do(func() {
+func (that *TableSchema[T]) Init() {
+	that.once.Do(func() {
 		// 取宿主类型的反射信息
 		var zero T
 		rt := reflect.TypeOf(zero) // *Host
@@ -141,17 +141,17 @@ func (s *TableSchema[T]) Init() {
 		if err != nil {
 			panic(err.Error())
 		}
-		s.meta = meta
+		that.meta = meta
 
-		s.hasGlobalField, s.globalOffset = detectGlobalField(rt.Elem())
+		that.hasGlobalField, that.globalOffset = detectGlobalField(rt.Elem())
 
 		// selfPtr 指向宿主结构体基址：
 		// s 是嵌入在宿主结构体内偏移 0 处的字段（嵌入结构体首字段），
 		// 因此 &s == 宿主基址（当且仅当 TableSchema 是第一个嵌入字段）。
 		// 使用 unsafe.Pointer(s) 即可得到宿主基址。
-		s.selfPtr = unsafe.Pointer(s)
+		that.selfPtr = unsafe.Pointer(that)
 
-		if s.useGlobalStorage() {
+		if that.useGlobalStorage() {
 			if _, gErr := initGlobalTypeOnce(rt); gErr != nil {
 				panic(gErr.Error())
 			}
@@ -161,78 +161,78 @@ func (s *TableSchema[T]) Init() {
 
 // Save 将宿主对象写入 Redis（同步）并提交 MySQL 异步存盘请求（不阻塞）。
 // 多次调用时，新的存盘请求会覆盖队列中尚未执行的旧请求，以减少 MySQL 写入次数。
-func (s *TableSchema[T]) Save() {
-	s.mustInit()
+func (that *TableSchema[T]) Save() {
+	that.mustInit()
 	ctx := context.Background()
-	pk := ReadPrimaryKey(s.selfPtr, s.meta.PrimaryField)
-	useGlobal := s.useGlobalStorage()
+	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
+	useGlobal := that.useGlobalStorage()
 
 	// 1. 同步写 Redis 热缓存
 	rds := getRedisStoreForRoute(useGlobal)
-	hostObj := s.hostInterface()
-	if err := rds.Set(ctx, s.meta.TableName, pk, hostObj); err != nil {
-		fmt.Printf("[gameorm] Save redis error [%s:%v]: %v\n", s.meta.TableName, pk, err)
+	hostObj := that.hostInterface()
+	if err := rds.Set(ctx, that.meta.TableName, pk, hostObj); err != nil {
+		fmt.Printf("[gameorm] Save redis error [%s:%v]: %v\n", that.meta.TableName, pk, err)
 	}
 
 	// 2. 异步入队 MySQL 存盘（不阻塞游戏逻辑）
-	getMySQLStoreForRoute(useGlobal).EnqueueSave(s.meta.TableName, s.meta, s.selfPtr)
+	getMySQLStoreForRoute(useGlobal).EnqueueSave(that.meta.TableName, that.meta, that.selfPtr)
 }
 
 // SaveR 仅将宿主对象写入 Redis，不提交 MySQL 异步存盘。
 // 适用于临时态/会话态等无需落盘 MySQL 的数据。
-func (s *TableSchema[T]) SaveR() {
-	s.mustInit()
+func (that *TableSchema[T]) SaveR() {
+	that.mustInit()
 	ctx := context.Background()
-	pk := ReadPrimaryKey(s.selfPtr, s.meta.PrimaryField)
-	hostObj := s.hostInterface()
-	useGlobal := s.useGlobalStorage()
+	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
+	hostObj := that.hostInterface()
+	useGlobal := that.useGlobalStorage()
 
-	if err := getRedisStoreForRoute(useGlobal).Set(ctx, s.meta.TableName, pk, hostObj); err != nil {
-		fmt.Printf("[gameorm] SaveR redis error [%s:%v]: %v\n", s.meta.TableName, pk, err)
+	if err := getRedisStoreForRoute(useGlobal).Set(ctx, that.meta.TableName, pk, hostObj); err != nil {
+		fmt.Printf("[gameorm] SaveR redis error [%s:%v]: %v\n", that.meta.TableName, pk, err)
 	}
 }
 
 // Load 按主键从 Redis 读取对象；Redis 未命中时降级读 MySQL，并回写 Redis。
 // 结果直接写入宿主对象字段（通过指针偏移），无额外分配。
-func (s *TableSchema[T]) Load() error {
-	s.mustInit()
+func (that *TableSchema[T]) Load() error {
+	that.mustInit()
 	ctx := context.Background()
-	pk := ReadPrimaryKey(s.selfPtr, s.meta.PrimaryField)
-	useGlobal := s.useGlobalStorage()
+	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
+	useGlobal := that.useGlobalStorage()
 
 	// 1. 先查 Redis
-	hostObj := s.hostInterface()
+	hostObj := that.hostInterface()
 	rds := getRedisStoreForRoute(useGlobal)
-	if err := rds.Get(ctx, s.meta.TableName, pk, hostObj); err == nil {
+	if err := rds.Get(ctx, that.meta.TableName, pk, hostObj); err == nil {
 		return nil
 	} else if !IsNotFound(err) {
-		fmt.Printf("[gameorm] Load redis error [%s:%v]: %v\n", s.meta.TableName, pk, err)
+		fmt.Printf("[gameorm] Load redis error [%s:%v]: %v\n", that.meta.TableName, pk, err)
 	}
 
 	// 2. Redis 未命中，查 MySQL
 	if globalPool == nil {
 		return fmt.Errorf("gameorm: pool not initialized")
 	}
-	return s.loadFromMySQL(ctx, pk, rds, useGlobal)
+	return that.loadFromMySQL(ctx, pk, rds, useGlobal)
 }
 
 // LoadR 仅从 Redis 加载对象，不会降级查询 MySQL。
-func (s *TableSchema[T]) LoadR() error {
-	s.mustInit()
+func (that *TableSchema[T]) LoadR() error {
+	that.mustInit()
 	ctx := context.Background()
-	pk := ReadPrimaryKey(s.selfPtr, s.meta.PrimaryField)
-	hostObj := s.hostInterface()
-	useGlobal := s.useGlobalStorage()
+	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
+	hostObj := that.hostInterface()
+	useGlobal := that.useGlobalStorage()
 
-	if err := getRedisStoreForRoute(useGlobal).Get(ctx, s.meta.TableName, pk, hostObj); err != nil {
-		return fmt.Errorf("gameorm: LoadR [%s:%v] redis: %w", s.meta.TableName, pk, err)
+	if err := getRedisStoreForRoute(useGlobal).Get(ctx, that.meta.TableName, pk, hostObj); err != nil {
+		return fmt.Errorf("gameorm: LoadR [%s:%v] redis: %w", that.meta.TableName, pk, err)
 	}
 	return nil
 }
 
 // loadFromMySQL 从 MySQL 按主键查询单行并回写 Redis（内部方法，保持 Load 函数简洁）。
-func (s *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *RedisStore, useGlobal bool) error {
-	meta := s.meta
+func (that *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *RedisStore, useGlobal bool) error {
+	meta := that.meta
 	cols := make([]string, len(meta.Fields))
 	for i, f := range meta.Fields {
 		cols[i] = fmt.Sprintf("`%s`", f.ColName)
@@ -243,14 +243,14 @@ func (s *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *RedisSt
 	)
 	db := GetPool().SelectMySQL(useGlobal)
 	row := db.QueryRowContext(ctx, query, pk)
-	scanDest, scanTargets := makeScanDest(meta, s.selfPtr)
+	scanDest, scanTargets := makeScanDest(meta, that.selfPtr)
 	if err := row.Scan(scanDest...); err != nil {
 		return fmt.Errorf("gameorm: Load [%s:%v] mysql: %w", meta.TableName, pk, err)
 	}
 	// 将扫描结果回写到字段
-	writeScanResultsToFields(meta, s.selfPtr, scanTargets)
+	writeScanResultsToFields(meta, that.selfPtr, scanTargets)
 	// 回写 Redis
-	hostObj := s.hostInterface()
+	hostObj := that.hostInterface()
 	ttl := getRedisStore().pool
 	_ = ttl
 	if err := rds.Set(ctx, meta.TableName, pk, hostObj); err != nil {
@@ -260,27 +260,27 @@ func (s *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *RedisSt
 }
 
 // Delete 软删除：Redis 删除缓存 + MySQL 异步设置 is_deleted=1。
-func (s *TableSchema[T]) Delete() {
-	s.mustInit()
+func (that *TableSchema[T]) Delete() {
+	that.mustInit()
 	ctx := context.Background()
-	pk := ReadPrimaryKey(s.selfPtr, s.meta.PrimaryField)
-	useGlobal := s.useGlobalStorage()
+	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
+	useGlobal := that.useGlobalStorage()
 
 	// 1. 删除 Redis 缓存
-	if err := getRedisStoreForRoute(useGlobal).Del(ctx, s.meta.TableName, pk); err != nil {
-		fmt.Printf("[gameorm] Delete redis error [%s:%v]: %v\n", s.meta.TableName, pk, err)
+	if err := getRedisStoreForRoute(useGlobal).Del(ctx, that.meta.TableName, pk); err != nil {
+		fmt.Printf("[gameorm] Delete redis error [%s:%v]: %v\n", that.meta.TableName, pk, err)
 	}
 	// 2. 异步软删除 MySQL
-	getMySQLStoreForRoute(useGlobal).EnqueueDelete(s.meta.TableName, s.meta, s.selfPtr)
+	getMySQLStoreForRoute(useGlobal).EnqueueDelete(that.meta.TableName, that.meta, that.selfPtr)
 }
 
 // FindAll 等效于 NewQueryBuilder[T].Where(cond).OrderBy(orderBy).Limit(limit).FindAll(ctx)。
 // 提供简洁的单行调用体验：users, err := user.FindAll("age > 18", "age DESC", 100)
-func (s *TableSchema[T]) FindAll(cond, orderBy string, limit int) ([]T, error) {
-	s.mustInit()
+func (that *TableSchema[T]) FindAll(cond, orderBy string, limit int) ([]T, error) {
+	that.mustInit()
 	ctx := context.Background()
-	useGlobal := s.useGlobalStorage()
-	return NewQueryBuilderWithDB[T](s.meta, GetPool().SelectMySQL(useGlobal)).
+	useGlobal := that.useGlobalStorage()
+	return NewQueryBuilderWithDB[T](that.meta, GetPool().SelectMySQL(useGlobal)).
 		Where(cond).
 		OrderBy(orderBy).
 		Limit(limit).
@@ -288,21 +288,21 @@ func (s *TableSchema[T]) FindAll(cond, orderBy string, limit int) ([]T, error) {
 }
 
 // Migrate 手动触发 AutoMigrate，用于测试或工具程序。
-func (s *TableSchema[T]) Migrate() error {
-	s.mustInit()
-	useGlobal := s.useGlobalStorage()
-	return newDDLBuilderWithDB(GetPool().SelectMySQL(useGlobal)).AutoMigrate(context.Background(), s.meta)
+func (that *TableSchema[T]) Migrate() error {
+	that.mustInit()
+	useGlobal := that.useGlobalStorage()
+	return newDDLBuilderWithDB(GetPool().SelectMySQL(useGlobal)).AutoMigrate(context.Background(), that.meta)
 }
 
 // Meta 返回宿主类型的 TableMeta，供高级用户直接操作。
-func (s *TableSchema[T]) Meta() *TableMeta {
-	s.mustInit()
-	return s.meta
+func (that *TableSchema[T]) Meta() *TableMeta {
+	that.mustInit()
+	return that.meta
 }
 
 // mustInit 确保 Init 已被调用；若未调用则 panic（开发期快速失败，避免静默错误）。
-func (s *TableSchema[T]) mustInit() {
-	if s.meta == nil {
+func (that *TableSchema[T]) mustInit() {
+	if that.meta == nil {
 		panic("gameorm: Init() must be called before any ORM operation")
 	}
 }
@@ -310,15 +310,15 @@ func (s *TableSchema[T]) mustInit() {
 // hostInterface 将宿主对象转换为 any，供 sonic 序列化使用。
 // 利用 T 的类型参数在编译期确定宿主指针类型，通过 unsafe 构造 interface，
 // 避免 reflect.NewAt(...).Interface() 带来的额外堆分配。
-func (s *TableSchema[T]) hostInterface() T {
-	return *(*T)(unsafe.Pointer(&s.selfPtr))
+func (that *TableSchema[T]) hostInterface() T {
+	return *(*T)(unsafe.Pointer(&that.selfPtr))
 }
 
-func (s *TableSchema[T]) useGlobalStorage() bool {
-	if !s.hasGlobalField {
+func (that *TableSchema[T]) useGlobalStorage() bool {
+	if !that.hasGlobalField {
 		return false
 	}
-	ptr := FieldPtr(s.selfPtr, s.globalOffset)
+	ptr := FieldPtr(that.selfPtr, that.globalOffset)
 	return *(*bool)(ptr)
 }
 
