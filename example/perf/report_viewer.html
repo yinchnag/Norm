@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GameORM 性能报告可视化</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --panel: #fffdf8;
+      --ink: #1f2328;
+      --sub: #5f6368;
+      --accent: #c0462c;
+      --line: #e7dccf;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at 20% 0%, #fffaf3 0%, var(--bg) 52%),
+                  linear-gradient(120deg, #f8f2e8 0%, #f2ebe1 100%);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .head {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 8px 24px rgba(31, 35, 40, 0.06);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 26px;
+      letter-spacing: 0.2px;
+    }
+    .sub {
+      color: var(--sub);
+      margin: 0 0 14px;
+    }
+    .ctrl {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    input[type="file"] {
+      padding: 8px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    button {
+      border: 0;
+      background: var(--accent);
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .meta {
+      margin-top: 12px;
+      font-size: 14px;
+      color: var(--sub);
+      line-height: 1.7;
+    }
+    .grid {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      box-shadow: 0 8px 24px rgba(31, 35, 40, 0.05);
+    }
+    .panel h3 {
+      margin: 4px 4px 10px;
+      font-size: 15px;
+    }
+    .chart {
+      width: 100%;
+      height: 320px;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+      .chart { height: 280px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <h1>GameORM 压测报告图表台</h1>
+      <p class="sub">读取 JSON 报告后，自动渲染多轮趋势和对比图。</p>
+      <div class="ctrl">
+        <input id="fileInput" type="file" accept="application/json" />
+      </div>
+      <div id="meta" class="meta">等待加载报告...</div>
+    </div>
+
+    <div class="grid">
+      <section class="panel"><h3>多轮 QPS 趋势</h3><div id="chartQpsTrend" class="chart"></div></section>
+      <section class="panel"><h3>多轮 Avg(us) 趋势</h3><div id="chartAvgTrend" class="chart"></div></section>
+      <section class="panel"><h3>汇总 QPS 对比</h3><div id="chartQpsBar" class="chart"></div></section>
+      <section class="panel"><h3>汇总 Avg(us) 对比</h3><div id="chartAvgBar" class="chart"></div></section>
+      <section class="panel"><h3>错误分布</h3><div id="chartErrPie" class="chart"></div></section>
+      <section class="panel"><h3>P95 / P99 延迟概览</h3><div id="chartP95P99" class="chart"></div></section>
+    </div>
+  </div>
+
+  <script>
+    const charts = {
+      qpsTrend: echarts.init(document.getElementById('chartQpsTrend')),
+      avgTrend: echarts.init(document.getElementById('chartAvgTrend')),
+      qpsBar: echarts.init(document.getElementById('chartQpsBar')),
+      avgBar: echarts.init(document.getElementById('chartAvgBar')),
+      errPie: echarts.init(document.getElementById('chartErrPie')),
+      p95p99: echarts.init(document.getElementById('chartP95P99')),
+    };
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const text = await file.text();
+      const data = JSON.parse(text);
+      renderAll(data);
+    });
+
+    function renderAll(report) {
+      if (!report || !Array.isArray(report.round_data) || !Array.isArray(report.compare_data)) {
+        alert('JSON 格式不正确，请使用压测程序生成的报告文件。');
+        return;
+      }
+      renderMeta(report);
+      renderQpsTrend(report);
+      renderAvgTrend(report);
+      renderQpsBar(report);
+      renderAvgBar(report);
+      renderErrPie(report);
+      renderP95P99(report);
+      for (const key in charts) charts[key].resize();
+    }
+
+    function renderMeta(r) {
+      const meta = document.getElementById('meta');
+      meta.innerHTML = [
+        '生成时间: ' + (r.generated_at || '-'),
+        '表名: ' + (r.table_name || '-'),
+        '样本 n: ' + (r.n || '-'),
+        'workers: ' + (r.workers || '-'),
+        '轮次: ' + (r.rounds || '-'),
+        'FindAll limit: ' + (r.find_limit || '-'),
+        'FindAll rounds: ' + (r.find_rounds || '-'),
+        'flush wait(ms): ' + (r.flush_wait_ms || '-'),
+      ].join('<br/>');
+    }
+
+    function getStageNames(report) {
+      const set = new Set();
+      for (const rd of report.round_data) {
+        for (const s of rd.stages || []) set.add(s.name);
+      }
+      return Array.from(set);
+    }
+
+    function renderQpsTrend(report) {
+      const rounds = report.round_data.map(x => 'R' + x.round_id);
+      const stageNames = getStageNames(report);
+      const series = stageNames.map(name => ({
+        name,
+        type: 'line',
+        smooth: true,
+        data: report.round_data.map(rd => {
+          const s = (rd.stages || []).find(x => x.name === name);
+          return s ? Number(s.qps.toFixed(2)) : 0;
+        })
+      }));
+      charts.qpsTrend.setOption({
+        tooltip: { trigger: 'axis' },
+        legend: { top: 0 },
+        xAxis: { type: 'category', data: rounds },
+        yAxis: { type: 'value', name: 'QPS' },
+        series
+      });
+    }
+
+    function renderAvgTrend(report) {
+      const rounds = report.round_data.map(x => 'R' + x.round_id);
+      const stageNames = getStageNames(report);
+      const series = stageNames.map(name => ({
+        name,
+        type: 'line',
+        smooth: true,
+        data: report.round_data.map(rd => {
+          const s = (rd.stages || []).find(x => x.name === name);
+          return s ? Number(s.avg_us.toFixed(2)) : 0;
+        })
+      }));
+      charts.avgTrend.setOption({
+        tooltip: { trigger: 'axis' },
+        legend: { top: 0 },
+        xAxis: { type: 'category', data: rounds },
+        yAxis: { type: 'value', name: 'Avg us' },
+        series
+      });
+    }
+
+    function renderQpsBar(report) {
+      const data = report.compare_data || [];
+      charts.qpsBar.setOption({
+        tooltip: { trigger: 'axis' },
+        xAxis: { type: 'category', data: data.map(x => x.stage), axisLabel: { rotate: 10 } },
+        yAxis: { type: 'value', name: 'QPS Avg' },
+        series: [{ type: 'bar', data: data.map(x => Number(x.qps_avg.toFixed(2))), itemStyle: { color: '#c0462c' } }]
+      });
+    }
+
+    function renderAvgBar(report) {
+      const data = report.compare_data || [];
+      charts.avgBar.setOption({
+        tooltip: { trigger: 'axis' },
+        xAxis: { type: 'category', data: data.map(x => x.stage), axisLabel: { rotate: 10 } },
+        yAxis: { type: 'value', name: 'Avg us' },
+        series: [{ type: 'bar', data: data.map(x => Number(x.avg_us_avg.toFixed(2))), itemStyle: { color: '#2f6f72' } }]
+      });
+    }
+
+    function renderErrPie(report) {
+      const data = (report.compare_data || []).map(x => ({ name: x.stage, value: x.err_total }));
+      charts.errPie.setOption({
+        tooltip: { trigger: 'item' },
+        legend: { top: 0 },
+        series: [{
+          type: 'pie',
+          radius: ['35%', '68%'],
+          data,
+          label: { formatter: '{b}: {c}' }
+        }]
+      });
+    }
+
+    function renderP95P99(report) {
+      const stageNames = getStageNames(report);
+      const p95 = [];
+      const p99 = [];
+      for (const name of stageNames) {
+        const vals95 = [];
+        const vals99 = [];
+        for (const rd of report.round_data) {
+          const s = (rd.stages || []).find(x => x.name === name);
+          if (s) {
+            vals95.push(s.p95_us || 0);
+            vals99.push(s.p99_us || 0);
+          }
+        }
+        p95.push(avg(vals95));
+        p99.push(avg(vals99));
+      }
+      charts.p95p99.setOption({
+        tooltip: { trigger: 'axis' },
+        legend: { top: 0 },
+        xAxis: { type: 'category', data: stageNames, axisLabel: { rotate: 10 } },
+        yAxis: { type: 'value', name: 'us' },
+        series: [
+          { name: 'P95 Avg', type: 'bar', data: p95, itemStyle: { color: '#7a9e3b' } },
+          { name: 'P99 Avg', type: 'bar', data: p99, itemStyle: { color: '#6d4e9a' } }
+        ]
+      });
+    }
+
+    function avg(arr) {
+      if (!arr.length) return 0;
+      return Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2));
+    }
+
+    window.addEventListener('resize', () => {
+      for (const key in charts) charts[key].resize();
+    });
+  </script>
+</body>
+</html>

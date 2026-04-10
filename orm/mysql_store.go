@@ -116,7 +116,7 @@ func getMySQLStoreForRoute(useGlobal bool) *MySQLStore {
 			return getMySQLStore()
 		}
 		globalRegionMySQLStoreOnce.Do(func() {
-			n := p.Cfg.WorkerCount
+			n := p.Cfg.GetWorkerCount()
 			s := &MySQLStore{
 				pool:      p,
 				useGlobal: true,
@@ -135,7 +135,7 @@ func getMySQLStoreForRoute(useGlobal bool) *MySQLStore {
 
 	mysqlStoreOnce.Do(func() {
 		p := GetPool()
-		n := p.Cfg.WorkerCount
+		n := p.Cfg.GetWorkerCount()
 		s := &MySQLStore{
 			pool:      p,
 			useGlobal: false,
@@ -154,7 +154,7 @@ func getMySQLStoreForRoute(useGlobal bool) *MySQLStore {
 
 // start 启动所有 worker goroutine。
 func (that *MySQLStore) start() {
-	interval := time.Duration(that.pool.Cfg.FlushIntervalMs) * time.Millisecond
+	interval := time.Duration(that.pool.Cfg.GetFlushIntervalMs()) * time.Millisecond
 	for i := range that.nWorker {
 		that.wg.Add(1)
 		go that.worker(i, interval)

@@ -51,7 +51,7 @@ func (that *RedisStore) Set(ctx context.Context, tableName string, pk any, obj a
 
 	key := redisKey(tableName, pk)
 	rcfg := that.pool.SelectRedisConfig(that.useGlobal)
-	ttl := time.Duration(rcfg.KeyTTLSec) * time.Second
+	ttl := time.Duration(rcfg.GetRedisKeyTTLSec()) * time.Second
 	client := that.pool.SelectRedis(that.useGlobal)
 	pipe := client.TxPipeline()
 	pipe.HSet(ctx, key, fields)

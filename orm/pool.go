@@ -7,7 +7,6 @@ import (
 
 	goredis "github.com/go-redis/redis/v8"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/norm/config"
 )
 
 // Pool 持有 MySQL 和 Redis 连接池的全局单例，由 InitPool 初始化。
@@ -16,39 +15,35 @@ type Pool struct {
 	Redis       *goredis.Client
 	GlobalDB    *sql.DB
 	GlobalRedis *goredis.Client
-	Cfg         *config.ORMConfig
+	Cfg         ORMConfiger
 }
 
 var globalPool *Pool
 
 // InitPool 通过配置文件路径初始化全局连接池；应在进程启动时调用一次。
-func InitPool(cfgPath string) error {
-	cfg, err := config.LoadFromFile(cfgPath)
-	if err != nil {
-		return fmt.Errorf("gameorm: load config: %w", err)
-	}
+func InitPool(cfg ORMConfiger) error {
 	return InitPoolWithConfig(cfg)
 }
 
 // InitPoolWithConfig 使用已加载的 *config.ORMConfig 初始化连接池，便于测试注入。
-func InitPoolWithConfig(cfg *config.ORMConfig) error {
-	db, err := openMySQL(&cfg.MySQL)
+func InitPoolWithConfig(cfg ORMConfiger) error {
+	db, err := openMySQL(cfg)
 	if err != nil {
 		return fmt.Errorf("gameorm: open mysql: %w", err)
 	}
-	rdb := openRedis(&cfg.Redis)
+	rdb := openRedis(cfg)
 
 	var globalDB *sql.DB
-	if cfg.GlobalMySQL != nil {
-		globalDB, err = openMySQL(cfg.GlobalMySQL)
+	if cfg.GlobalMysqlDSN() != "" {
+		globalDB, err = openMySQL(cfg)
 		if err != nil {
 			return fmt.Errorf("gameorm: open global mysql: %w", err)
 		}
 	}
 
 	var globalRedis *goredis.Client
-	if cfg.GlobalRedis != nil {
-		globalRedis = openRedis(cfg.GlobalRedis)
+	if cfg.GlobalRedisAddr() != "" {
+		globalRedis = openRedis(cfg)
 	}
 
 	globalPool = &Pool{
@@ -61,24 +56,24 @@ func InitPoolWithConfig(cfg *config.ORMConfig) error {
 	return nil
 }
 
-func openMySQL(cfg *config.DBConfig) (*sql.DB, error) {
-	db, err := sql.Open("mysql", cfg.DSN)
+func openMySQL(cfg ORMConfiger) (*sql.DB, error) {
+	db, err := sql.Open("mysql", cfg.GetMysqlDSN())
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(cfg.MaxOpenConns)
-	db.SetMaxIdleConns(cfg.MaxIdleConns)
-	db.SetConnMaxLifetime(time.Duration(cfg.ConnMaxLifetime) * time.Second)
+	db.SetMaxOpenConns(cfg.MysqlMaxOpenConns())
+	db.SetMaxIdleConns(cfg.MysqlMaxIdleConns())
+	db.SetConnMaxLifetime(time.Duration(cfg.MysqlConnMaxLifetime()) * time.Second)
 	return db, nil
 }
 
-func openRedis(cfg *config.RedisConfig) *goredis.Client {
+func openRedis(cfg ORMConfiger) *goredis.Client {
 	return goredis.NewClient(&goredis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		PoolSize:     cfg.PoolSize,
-		MinIdleConns: cfg.MinIdleConns,
+		Addr:         cfg.GetRedisAddr(),
+		Password:     cfg.GetRedisPassword(),
+		DB:           cfg.GetRedisDB(),
+		PoolSize:     cfg.GetRedisPoolSize(),
+		MinIdleConns: cfg.GetRedisMinIdleConns(),
 	})
 }
 
@@ -96,11 +91,11 @@ func (that *Pool) SelectRedis(useGlobal bool) *goredis.Client {
 	return that.Redis
 }
 
-func (that *Pool) SelectRedisConfig(useGlobal bool) *config.RedisConfig {
-	if useGlobal && that.Cfg != nil && that.Cfg.GlobalRedis != nil {
-		return that.Cfg.GlobalRedis
+func (that *Pool) SelectRedisConfig(useGlobal bool) ORMConfiger {
+	if useGlobal && that.Cfg != nil {
+		return that.Cfg
 	}
-	return &that.Cfg.Redis
+	return that.Cfg
 }
 
 // GetPool 返回全局连接池，未初始化时 panic（开发期快速失败）。

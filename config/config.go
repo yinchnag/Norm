@@ -16,9 +16,9 @@ type DBConfig struct {
 
 // RedisConfig Redis 连接配置
 type RedisConfig struct {
-	Addr         string `json:"addr"`          // host:port
-	Password     string `json:"password"`      // 无密码留空
-	DB           int    `json:"db"`            // 数据库编号，默认 0
+	Addr         string `json:"addr"`           // host:port
+	Password     string `json:"password"`       // 无密码留空
+	DB           int    `json:"db"`             // 数据库编号，默认 0
 	PoolSize     int    `json:"pool_size"`      // 连接池大小，默认 50
 	MinIdleConns int    `json:"min_idle_conns"` // 最小空闲连接数，默认 10
 	KeyTTLSec    int    `json:"key_ttl_sec"`    // Redis key 默认 TTL（秒），默认 7200
@@ -30,8 +30,70 @@ type ORMConfig struct {
 	Redis           RedisConfig  `json:"redis"`
 	GlobalMySQL     *DBConfig    `json:"global_mysql,omitempty"`
 	GlobalRedis     *RedisConfig `json:"global_redis,omitempty"`
-	FlushIntervalMs int        `json:"flush_interval_ms"` // 批量刷盘间隔（毫秒），默认 500
-	WorkerCount     int        `json:"worker_count"`       // 异步刷盘 goroutine 数，默认 4
+	FlushIntervalMs int          `json:"flush_interval_ms"` // 批量刷盘间隔（毫秒），默认 500
+	WorkerCount     int          `json:"worker_count"`      // 异步刷盘 goroutine 数，默认 4
+}
+
+func (that *ORMConfig) GetMysqlDSN() string { // 获得 MySQL 数据源名称（DSN），例如 "user:pass@tcp(host:port)/dbname?params"
+	return that.MySQL.DSN
+}
+
+func (that *ORMConfig) MysqlMaxOpenConns() int { // 获得 MySQL 连接池最大打开连接数
+	return that.MySQL.MaxOpenConns
+}
+
+func (that *ORMConfig) MysqlMaxIdleConns() int { // 获得 MySQL 连接池最大空闲连接数
+	return that.MySQL.MaxIdleConns
+}
+
+func (that *ORMConfig) MysqlConnMaxLifetime() int { // 获得 MySQL 连接最大存活时间（秒）
+	return that.MySQL.ConnMaxLifetime
+}
+
+func (that *ORMConfig) GetRedisAddr() string { // 获得 Redis 地址，例如 "host:port"
+	return that.Redis.Addr
+}
+
+func (that *ORMConfig) GetRedisPassword() string { // 获得 Redis 密码，若无密码则返回空字符串
+	return that.Redis.Password
+}
+
+func (that *ORMConfig) GetRedisDB() int { // 获得 Redis 数据库编号，默认 0
+	return that.Redis.DB
+}
+
+func (that *ORMConfig) GetRedisPoolSize() int { // 获得 Redis 连接池大小
+	return that.Redis.PoolSize
+}
+
+func (that *ORMConfig) GetRedisMinIdleConns() int { // 获得 Redis 最小空闲连接数
+	return that.Redis.MinIdleConns
+}
+
+func (that *ORMConfig) GetRedisKeyTTLSec() int { // 获得 Redis key 默认 TTL（秒）
+	return that.Redis.KeyTTLSec
+}
+
+func (that *ORMConfig) GlobalMysqlDSN() string { // 获得全局 MySQL 数据源名称（DSN），若未配置则返回空字符串
+	if that.GlobalMySQL != nil {
+		return that.GlobalMySQL.DSN
+	}
+	return ""
+}
+
+func (that *ORMConfig) GlobalRedisAddr() string { // 获得全局 Redis 地址，例如 "host:port"，若未配置则返回空字符串
+	if that.GlobalRedis != nil {
+		return that.GlobalRedis.Addr
+	}
+	return ""
+}
+
+func (that *ORMConfig) GetFlushIntervalMs() int {
+	return that.FlushIntervalMs
+}
+
+func (that *ORMConfig) GetWorkerCount() int {
+	return that.WorkerCount
 }
 
 // DefaultORMConfig 返回合理的默认值；未配置字段将被填充。

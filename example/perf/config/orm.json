@@ -1,0 +1,18 @@
+{
+  "mysql": {
+    "dsn": "root:rootpassword@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local",
+    "max_open_conns": 200,
+    "max_idle_conns": 100,
+    "conn_max_lifetime": 3600
+  },
+  "redis": {
+    "addr": "127.0.0.1:6379",
+    "password": "",
+    "db": 0,
+    "pool_size": 200,
+    "min_idle_conns": 50,
+    "key_ttl_sec": 7200
+  },
+  "flush_interval_ms": 200,
+  "worker_count": 8
+}
