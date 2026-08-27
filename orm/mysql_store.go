@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -21,6 +22,11 @@ type pendingItem struct {
 	meta      *TableMeta
 	snapshot  []any // 字段值快照，与 meta.Fields 一一对应
 	deleted   bool  // 是否标记删除
+
+	// 以下两个字段只由持有该队列的 worker goroutine 读写：
+	// push 永远创建新的 pendingItem，不会修改已入队的条目，因此无需加锁。
+	attempts   int       // 已尝试刷盘次数，用于退避与告警
+	retryAfter time.Time // 早于此刻不再重试；零值表示立即可刷
 }
 
 // flushQueue 是单个 worker 的待刷盘队列，使用 map 保证同 key 只保留最新快照。
@@ -39,28 +45,72 @@ func (that *flushQueue) push(item *pendingItem) {
 	that.mu.Unlock()
 }
 
-func (that *flushQueue) drain() []*pendingItem {
+// due 返回当前到期、可以尝试刷盘的条目。
+// 条目仍然留在队列里——只有 settle 才会移除它，失败的写入因此天然获得重试机会。
+func (that *flushQueue) due(now time.Time) []*pendingItem {
 	that.mu.Lock()
+	defer that.mu.Unlock()
+	out := make([]*pendingItem, 0, len(that.items))
+	for _, v := range that.items {
+		if !v.retryAfter.After(now) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// all 返回队列中全部条目，忽略退避时间。
+// 用于关闭前的最后一次刷盘，以及退出时报告仍未落盘的存档。
+func (that *flushQueue) all() []*pendingItem {
+	that.mu.Lock()
+	defer that.mu.Unlock()
 	out := make([]*pendingItem, 0, len(that.items))
 	for _, v := range that.items {
 		out = append(out, v)
 	}
-	that.items = make(map[string]*pendingItem, 64)
-	that.mu.Unlock()
 	return out
+}
+
+// settle 在刷盘成功后把条目移出队列。
+// 若期间已有新的 Save 覆盖同一 key，队列里就不再是这一条，此时什么都不做——
+// 新快照必须保留下来，否则会把更新的存档丢掉。
+func (that *flushQueue) settle(item *pendingItem) {
+	that.mu.Lock()
+	if that.items[item.key] == item {
+		delete(that.items, item.key)
+	}
+	that.mu.Unlock()
+}
+
+// backoff 在刷盘失败后把条目留在队列里，并记录下次可重试的时刻。
+// 同样只在队列里仍是这一条时才生效：被新快照覆盖的旧条目直接作废，
+// 因为新快照包含了它的全部内容。
+func (that *flushQueue) backoff(item *pendingItem, retryAt time.Time) {
+	that.mu.Lock()
+	if that.items[item.key] == item {
+		item.retryAfter = retryAt
+	}
+	that.mu.Unlock()
 }
 
 // MySQLStore 管理异步、批量、去重的 MySQL 刷盘。
 // 架构：N 个 worker goroutine，每隔 FlushInterval 批量执行 UPSERT/软删除。
 // 提交操作：调用 EnqueueSave/EnqueueDelete 仅将快照入队，不阻塞游戏逻辑。
 type MySQLStore struct {
-	pool      *Pool
-	useGlobal bool
-	queues    []*flushQueue
-	nWorker   int
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
+	pool          *Pool
+	useGlobal     bool
+	queues        []*flushQueue
+	nWorker       int
+	flushInterval time.Duration
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	stopOnce      sync.Once   // 保证 Stop 幂等，重复调用不会 close 已关闭的 channel
+	stopped       atomic.Bool // 置位后拒收新的写入请求，不再静默入队
 }
+
+// maxRetryBackoff 是刷盘失败重试的退避上限。
+// 退避从 FlushInterval 起按 2 的幂增长，封顶于此值。
+var maxRetryBackoff = 30 * time.Second
 
 var (
 	globalMySQLStore           *MySQLStore
@@ -119,11 +169,12 @@ func getMySQLStoreForRoute(useGlobal bool) *MySQLStore {
 		globalRegionMySQLStoreOnce.Do(func() {
 			n := p.Cfg.GetWorkerCount()
 			s := &MySQLStore{
-				pool:      p,
-				useGlobal: true,
-				nWorker:   n,
-				queues:    make([]*flushQueue, n),
-				stopCh:    make(chan struct{}),
+				pool:          p,
+				useGlobal:     true,
+				nWorker:       n,
+				flushInterval: flushIntervalOf(p),
+				queues:        make([]*flushQueue, n),
+				stopCh:        make(chan struct{}),
 			}
 			for i := range n {
 				s.queues[i] = newFlushQueue()
@@ -138,11 +189,12 @@ func getMySQLStoreForRoute(useGlobal bool) *MySQLStore {
 		p := GetPool()
 		n := p.Cfg.GetWorkerCount()
 		s := &MySQLStore{
-			pool:      p,
-			useGlobal: false,
-			nWorker:   n,
-			queues:    make([]*flushQueue, n),
-			stopCh:    make(chan struct{}),
+			pool:          p,
+			useGlobal:     false,
+			nWorker:       n,
+			flushInterval: flushIntervalOf(p),
+			queues:        make([]*flushQueue, n),
+			stopCh:        make(chan struct{}),
 		}
 		for i := range n {
 			s.queues[i] = newFlushQueue()
@@ -153,63 +205,127 @@ func getMySQLStoreForRoute(useGlobal bool) *MySQLStore {
 	return globalMySQLStore
 }
 
+// flushIntervalOf 从连接池配置读取刷盘间隔，非法值回退到 500ms。
+func flushIntervalOf(p *Pool) time.Duration {
+	ms := p.Cfg.GetFlushIntervalMs()
+	if ms <= 0 {
+		ms = 500
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // start 启动所有 worker goroutine。
 func (that *MySQLStore) start() {
-	interval := time.Duration(that.pool.Cfg.GetFlushIntervalMs()) * time.Millisecond
 	for i := range that.nWorker {
 		that.wg.Add(1)
-		go that.worker(i, interval)
+		go that.worker(i)
 	}
 }
 
-// Stop 优雅停止所有 worker：先关闭信号，再等待最后一次 flush 完成。
+// Stop 优雅停止所有 worker：
+//  1. 置位 stopped，拒收新的写入请求
+//  2. 等待每个 worker 完成最后一次刷盘
+//  3. 报告仍未落库的存档，避免退出时静默丢档
+//
+// 重复调用是安全的。
 func (that *MySQLStore) Stop() {
-	close(that.stopCh)
-	that.wg.Wait()
+	that.stopOnce.Do(func() {
+		that.stopped.Store(true)
+		close(that.stopCh)
+		that.wg.Wait()
+		that.reportUnflushed()
+	})
 }
 
-func (that *MySQLStore) worker(idx int, interval time.Duration) {
+// reportUnflushed 报告进程退出时仍未落库的存档。
+// 走到这一步说明 MySQL 在关服期间也写不进去，只能把丢失的内容暴露出来。
+func (that *MySQLStore) reportUnflushed() {
+	for _, q := range that.queues {
+		for _, item := range q.all() {
+			reportArchiveError(archiveErrorOf(item, errNotFlushed, true))
+		}
+	}
+}
+
+func (that *MySQLStore) worker(idx int) {
 	defer that.wg.Done()
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(that.flushInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			that.flush(that.queues[idx])
 		case <-that.stopCh:
-			that.flush(that.queues[idx]) // 关闭前最后一次 flush，防丢档
+			// 关闭前最后一次刷盘，忽略退避时间，给每条存档最后一次机会
+			that.flushItems(that.queues[idx], that.queues[idx].all())
 			return
 		}
 	}
 }
 
-// flush 批量执行队列内所有 pendingItem 对应的 SQL。
+// flush 尝试刷盘队列中所有到期条目。
 func (that *MySQLStore) flush(q *flushQueue) {
-	items := q.drain()
-	if len(items) == 0 {
-		return
-	}
+	that.flushItems(q, q.due(time.Now()))
+}
 
+// flushItems 逐条执行 SQL。
+// 失败的条目不会被移出队列，而是记录退避时间等下一轮重试——
+// UPSERT 与软删除都是幂等的，重复执行不会产生副作用。
+func (that *MySQLStore) flushItems(q *flushQueue, items []*pendingItem) {
 	for _, item := range items {
-		that.execItem(item)
+		item.attempts++
+		err := that.execItem(item)
+		if err == nil {
+			q.settle(item)
+			continue
+		}
+		reportArchiveError(archiveErrorOf(item, err, false))
+		q.backoff(item, time.Now().Add(that.retryBackoff(item.attempts)))
+	}
+}
+
+// retryBackoff 按已尝试次数做指数退避：FlushInterval, 2x, 4x ... 封顶 maxRetryBackoff。
+func (that *MySQLStore) retryBackoff(attempts int) time.Duration {
+	d := that.flushInterval
+	if d <= 0 {
+		d = 500 * time.Millisecond
+	}
+	for i := 1; i < attempts && d < maxRetryBackoff; i++ {
+		d *= 2
+	}
+	if d > maxRetryBackoff {
+		return maxRetryBackoff
+	}
+	return d
+}
+
+// archiveErrorOf 由待刷盘条目构造一条失败事件。
+func archiveErrorOf(item *pendingItem, err error, dropped bool) ArchiveError {
+	return ArchiveError{
+		Table:   item.tableName,
+		PK:      item.snapshot[pkIndex(item.meta)],
+		Deleted: item.deleted,
+		Attempt: item.attempts,
+		Dropped: dropped,
+		Err:     err,
 	}
 }
 
 // execItem 为单条 item 独立分配 5s context 并执行 SQL，
 // 单次写操作超时不影响同批次其他条目。
-func (that *MySQLStore) execItem(item *pendingItem) {
+// 返回的错误由调用方决定重试还是上报，这里不做处理。
+func (that *MySQLStore) execItem(item *pendingItem) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if item.deleted {
-		that.execSoftDelete(ctx, item)
-	} else {
-		that.execUpsert(ctx, item)
+		return that.execSoftDelete(ctx, item)
 	}
+	return that.execUpsert(ctx, item)
 }
 
 // execUpsert 执行 INSERT ... ON DUPLICATE KEY UPDATE（自动幂等）。
 // 每次更新都会将 is_deleted 复位为 0，并刷新 update_time。
-func (that *MySQLStore) execUpsert(ctx context.Context, item *pendingItem) {
+func (that *MySQLStore) execUpsert(ctx context.Context, item *pendingItem) error {
 	fields := item.meta.Fields
 	cols := make([]string, 0, len(fields)+3)
 	placeholders := make([]string, 0, len(fields)+3)
@@ -240,15 +356,13 @@ func (that *MySQLStore) execUpsert(ctx context.Context, item *pendingItem) {
 		strings.Join(placeholders, ","),
 		strings.Join(updates, ","),
 	)
-	if _, err := that.pool.SelectMySQL(that.useGlobal).ExecContext(ctx, sql, args...); err != nil {
-		// 游戏服务器不应因存档失败崩溃；记录错误，等下次 flush 重试
-		// TODO: 接入项目日志组件
-		fmt.Printf("[gameorm] upsert error table=%s pk=%v: %v\n", item.tableName, item.snapshot[indexOf(item.meta)], err)
-	}
+	// 游戏服务器不应因存档失败崩溃：把错误交回给刷盘循环，由它安排重试与上报
+	_, err := that.pool.SelectMySQL(that.useGlobal).ExecContext(ctx, sql, args...)
+	return err
 }
 
 // execSoftDelete 通过设置 is_deleted=1 实现软删除，同时刷新 update_time。
-func (that *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) {
+func (that *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) error {
 	pk := item.meta.PrimaryField
 	pkVal := item.snapshot[pkIndex(item.meta)]
 
@@ -256,9 +370,25 @@ func (that *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) {
 		"UPDATE `%s` SET `is_deleted`=1, `update_time`=NOW() WHERE `%s`=? AND `is_deleted`=0",
 		item.tableName, pk.ColName,
 	)
-	if _, err := that.pool.SelectMySQL(that.useGlobal).ExecContext(ctx, sql, pkVal); err != nil {
-		fmt.Printf("[gameorm] softDelete error table=%s pk=%v: %v\n", item.tableName, pkVal, err)
+	_, err := that.pool.SelectMySQL(that.useGlobal).ExecContext(ctx, sql, pkVal)
+	return err
+}
+
+// rejectIfStopped 在存储已关闭时拒收写入请求并上报。
+// 关闭后 worker 已经退出，继续入队等于静默丢档，必须让业务能感知到。
+func (that *MySQLStore) rejectIfStopped(tableName string, pk any, deleted bool) bool {
+	if !that.stopped.Load() {
+		return false
 	}
+	reportArchiveError(ArchiveError{
+		Table:   tableName,
+		PK:      pk,
+		Deleted: deleted,
+		Attempt: 0,
+		Dropped: true,
+		Err:     errStoreStopped,
+	})
+	return true
 }
 
 // EnqueueSave 读取对象字段快照后入队，不阻塞调用方。
@@ -274,6 +404,9 @@ func (that *MySQLStore) EnqueueSave(tableName string, meta *TableMeta, base unsa
 func (that *MySQLStore) EnqueueSaveSnapshot(tableName string, meta *TableMeta, snap []any) {
 	frozenMeta := freezeTableMeta(meta)
 	pk := snap[pkIndex(frozenMeta)]
+	if that.rejectIfStopped(tableName, pk, false) {
+		return
+	}
 	key := fmt.Sprintf("%s:%v", tableName, pk)
 	idx := hashKey(key) % uint64(that.nWorker)
 	that.queues[idx].push(&pendingItem{
@@ -289,6 +422,9 @@ func (that *MySQLStore) EnqueueDelete(tableName string, meta *TableMeta, base un
 	frozenMeta := freezeTableMeta(meta)
 	snap := snapshotFields(frozenMeta, base)
 	pk := snap[pkIndex(frozenMeta)]
+	if that.rejectIfStopped(tableName, pk, true) {
+		return
+	}
 	key := fmt.Sprintf("%s:%v", tableName, pk)
 	idx := hashKey(key) % uint64(that.nWorker)
 	that.queues[idx].push(&pendingItem{
@@ -372,9 +508,6 @@ func pkIndex(meta *TableMeta) int {
 	}
 	return 0
 }
-
-// indexOf 同 pkIndex，语义别名用于 execUpsert 日志。
-func indexOf(meta *TableMeta) int { return pkIndex(meta) }
 
 // Shutdown 等待所有异步 MySQL 写操作完成后停止 worker，适用于进程优雅退出场景。
 // 若 worker 从未启动（未调用过 Save/Delete），此函数为空操作。

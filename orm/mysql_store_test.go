@@ -2,9 +2,11 @@ package orm
 
 import (
 	"database/sql/driver"
+	"errors"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 type flushTestObj struct {
@@ -13,28 +15,95 @@ type flushTestObj struct {
 	Score int    `orm:"name:score"`
 }
 
+// pushFlushItem 把一个对象的快照按固定 key 压入队列，返回入队的条目。
+func pushFlushItem(q *flushQueue, meta *TableMeta, o *flushTestObj) *pendingItem {
+	item := &pendingItem{
+		key:       "t:1",
+		tableName: "t",
+		meta:      meta,
+		snapshot:  snapshotFields(meta, pointerOf(o)),
+	}
+	q.push(item)
+	return item
+}
+
 func TestFlushQueueDedup(t *testing.T) {
 	q := newFlushQueue()
 
 	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
-	obj1 := &flushTestObj{ID: 1, Name: "v1", Score: 10}
-	obj2 := &flushTestObj{ID: 1, Name: "v2", Score: 20}
+	pushFlushItem(q, meta, &flushTestObj{ID: 1, Name: "v1", Score: 10})
+	pushFlushItem(q, meta, &flushTestObj{ID: 1, Name: "v2", Score: 20}) // 应覆盖 v1
 
-	push := func(o *flushTestObj) {
-		snap := snapshotFields(meta, pointerOf(o))
-		q.push(&pendingItem{key: "t:1", tableName: "t", meta: meta, snapshot: snap})
-	}
-	push(obj1)
-	push(obj2) // 应覆盖 obj1
-
-	items := q.drain()
+	items := q.due(time.Now())
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item after dedup, got %d", len(items))
 	}
-	// snapshot 应该是 obj2 的值
+	// snapshot 应该是 v2 的值
 	nameIdx := 1 // Fields[1] = name
 	if items[0].snapshot[nameIdx].(string) != "v2" {
 		t.Errorf("expected v2, got %v", items[0].snapshot[nameIdx])
+	}
+}
+
+// TestFlushQueueKeepsItemUntilSettled 刷盘失败的条目必须留在队列里等重试，
+// 这是 P0 修复的核心：旧实现 drain() 一次性摘走全部条目，失败即永久丢失。
+func TestFlushQueueKeepsItemUntilSettled(t *testing.T) {
+	q := newFlushQueue()
+	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
+	item := pushFlushItem(q, meta, &flushTestObj{ID: 1, Name: "v1"})
+
+	now := time.Now()
+	if got := len(q.due(now)); got != 1 {
+		t.Fatalf("首次应有 1 条待刷，实际 %d", got)
+	}
+
+	// 模拟一次失败：退避到 1 秒后
+	q.backoff(item, now.Add(time.Second))
+	if got := len(q.due(now)); got != 0 {
+		t.Fatalf("退避期内不应重试，实际有 %d 条", got)
+	}
+	if got := len(q.all()); got != 1 {
+		t.Fatalf("条目必须留在队列里，实际 %d", got)
+	}
+
+	// 退避到期后重新可刷
+	if got := len(q.due(now.Add(2 * time.Second))); got != 1 {
+		t.Fatalf("退避到期后应可重试，实际 %d", got)
+	}
+
+	// 成功后才移除
+	q.settle(item)
+	if got := len(q.all()); got != 0 {
+		t.Fatalf("成功后队列应为空，实际 %d", got)
+	}
+}
+
+// TestFlushQueueNewerSnapshotWinsOverRetry 重试期间若有新的 Save 覆盖同一 key，
+// 必须以新快照为准；旧条目的成功或失败都不能影响新快照。
+func TestFlushQueueNewerSnapshotWinsOverRetry(t *testing.T) {
+	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
+	nameIdx := 1
+
+	// 情况一：旧条目重试失败，新快照必须原样留下且立即可刷
+	q := newFlushQueue()
+	old := pushFlushItem(q, meta, &flushTestObj{ID: 1, Name: "old"})
+	pushFlushItem(q, meta, &flushTestObj{ID: 1, Name: "new"})
+	q.backoff(old, time.Now().Add(time.Hour))
+
+	items := q.due(time.Now())
+	if len(items) != 1 || items[0].snapshot[nameIdx].(string) != "new" {
+		t.Fatalf("新快照应立即可刷，实际 %+v", items)
+	}
+
+	// 情况二：旧条目重试成功，也不能把新快照删掉
+	q2 := newFlushQueue()
+	old2 := pushFlushItem(q2, meta, &flushTestObj{ID: 1, Name: "old"})
+	pushFlushItem(q2, meta, &flushTestObj{ID: 1, Name: "new"})
+	q2.settle(old2)
+
+	remain := q2.all()
+	if len(remain) != 1 || remain[0].snapshot[nameIdx].(string) != "new" {
+		t.Fatalf("旧条目成功不应移除新快照，实际 %+v", remain)
 	}
 }
 
@@ -170,4 +239,114 @@ func TestJSONValueIsDriverValuer(t *testing.T) {
 	if s, ok := got.(string); !ok || s != `{"a":1}` {
 		t.Fatalf("Value() 应返回原始 JSON 文本，实际 %#v", got)
 	}
+}
+
+// newTestStore 构造一个不连数据库的 MySQLStore，用于验证队列与关闭语义。
+func newTestStore(nWorker int) *MySQLStore {
+	s := &MySQLStore{
+		nWorker:       nWorker,
+		flushInterval: 500 * time.Millisecond,
+		queues:        make([]*flushQueue, nWorker),
+		stopCh:        make(chan struct{}),
+	}
+	for i := range nWorker {
+		s.queues[i] = newFlushQueue()
+	}
+	return s
+}
+
+// captureArchiveErrors 接管失败回调并返回收集到的事件，测试结束自动还原。
+func captureArchiveErrors(t *testing.T) *[]ArchiveError {
+	t.Helper()
+	var mu sync.Mutex
+	events := make([]ArchiveError, 0, 4)
+	SetArchiveErrorHandler(func(ev ArchiveError) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	})
+	t.Cleanup(func() { SetArchiveErrorHandler(nil) })
+	return &events
+}
+
+// TestStopIsIdempotent 关服路径上多处调用 Shutdown 不应 panic。
+func TestStopIsIdempotent(t *testing.T) {
+	s := newTestStore(1)
+	s.Stop()
+	s.Stop() // 旧实现在这里 close 了已关闭的 channel
+	s.Stop()
+}
+
+// TestStopReportsUnflushedItems 退出时仍未落库的存档必须被报出来，不能静默消失。
+func TestStopReportsUnflushedItems(t *testing.T) {
+	events := captureArchiveErrors(t)
+	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
+
+	s := newTestStore(1)
+	pushFlushItem(s.queues[0], meta, &flushTestObj{ID: 1, Name: "未落库"})
+	s.Stop()
+
+	if len(*events) != 1 {
+		t.Fatalf("应报告 1 条未落库存档，实际 %d", len(*events))
+	}
+	ev := (*events)[0]
+	if !ev.Dropped || !errors.Is(ev.Err, errNotFlushed) {
+		t.Fatalf("事件内容不符: %+v", ev)
+	}
+}
+
+// TestEnqueueAfterStopIsReported 关闭之后再 Save，旧实现会静默入队然后丢掉。
+func TestEnqueueAfterStopIsReported(t *testing.T) {
+	events := captureArchiveErrors(t)
+	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
+
+	s := newTestStore(1)
+	s.Stop()
+	*events = (*events)[:0] // 忽略 Stop 自身可能产生的事件
+
+	obj := &flushTestObj{ID: 7, Name: "关服后写入"}
+	s.EnqueueSaveSnapshot("t", meta, snapshotFields(meta, pointerOf(obj)))
+
+	if len(*events) != 1 {
+		t.Fatalf("关闭后入队应上报 1 条，实际 %d", len(*events))
+	}
+	ev := (*events)[0]
+	if !ev.Dropped || !errors.Is(ev.Err, errStoreStopped) {
+		t.Fatalf("事件内容不符: %+v", ev)
+	}
+	for _, q := range s.queues {
+		if got := len(q.all()); got != 0 {
+			t.Fatalf("关闭后不应再入队，队列里却有 %d 条", got)
+		}
+	}
+}
+
+// TestRetryBackoffGrowsAndCaps 退避应指数增长并封顶。
+func TestRetryBackoffGrowsAndCaps(t *testing.T) {
+	s := newTestStore(1)
+	cases := []struct {
+		attempts int
+		want     time.Duration
+	}{
+		{1, 500 * time.Millisecond},
+		{2, time.Second},
+		{3, 2 * time.Second},
+		{100, maxRetryBackoff},
+	}
+	for _, c := range cases {
+		if got := s.retryBackoff(c.attempts); got != c.want {
+			t.Errorf("retryBackoff(%d) = %v, want %v", c.attempts, got, c.want)
+		}
+	}
+}
+
+// TestArchiveErrorHandlerPanicDoesNotBreakFlush 业务回调 panic 不能拖垮刷盘 worker。
+func TestArchiveErrorHandlerPanicDoesNotBreakFlush(t *testing.T) {
+	SetArchiveErrorHandler(func(ArchiveError) { panic("业务回调炸了") })
+	t.Cleanup(func() { SetArchiveErrorHandler(nil) })
+
+	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
+	s := newTestStore(1)
+	pushFlushItem(s.queues[0], meta, &flushTestObj{ID: 1, Name: "x"})
+	s.Stop() // 内部会触发回调；不应把测试带崩
 }
