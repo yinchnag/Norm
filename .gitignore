@@ -1,0 +1,6 @@
+# 编译产物
+*.exe
+*.test
+
+# 性能压测输出（example/perf 的 -report-out 生成）
+example/perf/reports/
