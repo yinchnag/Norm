@@ -4,9 +4,12 @@ import (
 	"database/sql/driver"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bytedance/sonic"
 )
 
 type flushTestObj struct {
@@ -314,6 +317,10 @@ func TestEnqueueAfterStopIsReported(t *testing.T) {
 	if !ev.Dropped || !errors.Is(ev.Err, errStoreStopped) {
 		t.Fatalf("事件内容不符: %+v", ev)
 	}
+	// 这条数据不会落库，日志必须带着完整内容
+	if ev.Columns["name"] != "关服后写入" {
+		t.Fatalf("上报缺少存档内容: %v", ev.Columns)
+	}
 	for _, q := range s.queues {
 		if got := len(q.all()); got != 0 {
 			t.Fatalf("关闭后不应再入队，队列里却有 %d 条", got)
@@ -349,4 +356,138 @@ func TestArchiveErrorHandlerPanicDoesNotBreakFlush(t *testing.T) {
 	s := newTestStore(1)
 	pushFlushItem(s.queues[0], meta, &flushTestObj{ID: 1, Name: "x"})
 	s.Stop() // 内部会触发回调；不应把测试带崩
+}
+
+// payloadTestObj 带一个复杂字段，用于验证上报内容里 JSON 列的形态。
+type payloadTestObj struct {
+	ID   int64            `orm:"primary,name:id"`
+	Name string           `orm:"name:name"`
+	Bag  map[string]int64 `orm:"name:bag"`
+}
+
+// alwaysFail 是永远失败的 exec 桩。
+func alwaysFail(err error) func(*pendingItem) error {
+	return func(*pendingItem) error { return err }
+}
+
+// TestFlushGivesUpAfterMaxRetries 首次尝试 + maxFlushRetries 次重试后放弃，
+// 每次失败都要上报一次，最后一次标记为 Dropped 并把条目移出队列。
+func TestFlushGivesUpAfterMaxRetries(t *testing.T) {
+	events := captureArchiveErrors(t)
+	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
+
+	s := newTestStore(1)
+	q := s.queues[0]
+	pushFlushItem(q, meta, &flushTestObj{ID: 1, Name: "v1"})
+
+	boom := errors.New("mysql 挂了")
+	// all() 忽略退避，等价于把每一轮重试都走一遍
+	for i := 0; i < maxFlushRetries+3; i++ {
+		s.flushItems(q, q.all(), alwaysFail(boom))
+	}
+
+	wantAttempts := maxFlushRetries + 1
+	if len(*events) != wantAttempts {
+		t.Fatalf("应上报 %d 次（首次 + %d 次重试），实际 %d 次",
+			wantAttempts, maxFlushRetries, len(*events))
+	}
+	for i, ev := range *events {
+		if ev.Attempt != i+1 {
+			t.Errorf("第 %d 条上报的 Attempt = %d，期望 %d", i, ev.Attempt, i+1)
+		}
+		wantDropped := i == wantAttempts-1
+		if ev.Dropped != wantDropped {
+			t.Errorf("第 %d 条上报 Dropped = %v，期望 %v", i, ev.Dropped, wantDropped)
+		}
+	}
+	if got := len(q.all()); got != 0 {
+		t.Fatalf("放弃后条目应移出队列，实际还剩 %d 条", got)
+	}
+}
+
+// TestFlushStopsRetryingOnceSucceeded 中途成功就不该再重试，也不该出现 Dropped。
+func TestFlushStopsRetryingOnceSucceeded(t *testing.T) {
+	events := captureArchiveErrors(t)
+	meta := GetTableMeta(reflect.TypeOf(&flushTestObj{}))
+
+	s := newTestStore(1)
+	q := s.queues[0]
+	pushFlushItem(q, meta, &flushTestObj{ID: 1, Name: "v1"})
+
+	calls := 0
+	exec := func(*pendingItem) error {
+		calls++
+		if calls <= 2 {
+			return errors.New("暂时写不进去")
+		}
+		return nil
+	}
+	for i := 0; i < 5; i++ {
+		s.flushItems(q, q.all(), exec)
+	}
+
+	if calls != 3 {
+		t.Fatalf("成功后不应再执行，实际执行 %d 次", calls)
+	}
+	if len(*events) != 2 {
+		t.Fatalf("应只为两次失败各上报一次，实际 %d 次", len(*events))
+	}
+	for _, ev := range *events {
+		if ev.Dropped {
+			t.Errorf("未用尽重试次数不应标记 Dropped: %+v", ev)
+		}
+	}
+	if got := len(q.all()); got != 0 {
+		t.Fatalf("成功后队列应为空，实际 %d 条", got)
+	}
+}
+
+// TestArchiveErrorCarriesRecoverableData 上报内容必须足以从日志恢复这条存档：
+// 列名齐全，值就是当初要绑定给 SQL 的参数（复杂字段是已编码好的 JSON 文本）。
+func TestArchiveErrorCarriesRecoverableData(t *testing.T) {
+	events := captureArchiveErrors(t)
+	meta := GetTableMeta(reflect.TypeOf(&payloadTestObj{}))
+	obj := &payloadTestObj{ID: 1001, Name: "阿吉", Bag: map[string]int64{"gold": 99}}
+
+	s := newTestStore(1)
+	q := s.queues[0]
+	q.push(&pendingItem{
+		key: "payload_test_obj:1001", tableName: "payload_test_obj",
+		meta: meta, snapshot: snapshotFields(meta, pointerOf(obj)),
+	})
+	s.flushItems(q, q.all(), alwaysFail(errors.New("boom")))
+
+	if len(*events) != 1 {
+		t.Fatalf("应上报 1 次，实际 %d", len(*events))
+	}
+	ev := (*events)[0]
+
+	if ev.Table != "payload_test_obj" || ev.PK != int64(1001) {
+		t.Fatalf("表名/主键不符: %+v", ev)
+	}
+	if len(ev.Columns) != 3 {
+		t.Fatalf("列数不符: %v", ev.Columns)
+	}
+	if ev.Columns["name"] != "阿吉" {
+		t.Errorf("name 列不符: %v", ev.Columns["name"])
+	}
+
+	// 日志里的 JSON 必须能解析回来，且每个值可以直接当 SQL 参数用
+	var back map[string]any
+	if err := sonic.UnmarshalString(ev.PayloadJSON(), &back); err != nil {
+		t.Fatalf("PayloadJSON 不是合法 JSON: %v (%s)", err, ev.PayloadJSON())
+	}
+	bag, ok := back["bag"].(string)
+	if !ok {
+		t.Fatalf("JSON 列应渲染成字符串形式的 SQL 参数，实际 %T", back["bag"])
+	}
+	var bagBack map[string]int64
+	if err := sonic.UnmarshalString(bag, &bagBack); err != nil || bagBack["gold"] != 99 {
+		t.Fatalf("bag 内容无法还原: %q err=%v", bag, err)
+	}
+
+	// 默认日志格式里也必须带上数据
+	if !strings.Contains(ev.Error(), "data=") || !strings.Contains(ev.Error(), "gold") {
+		t.Fatalf("Error() 未包含存档内容: %s", ev.Error())
+	}
 }

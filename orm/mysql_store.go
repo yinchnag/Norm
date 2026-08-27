@@ -108,8 +108,14 @@ type MySQLStore struct {
 	stopped       atomic.Bool // 置位后拒收新的写入请求，不再静默入队
 }
 
+// maxFlushRetries 是刷盘失败后的最大重试次数，不含首次尝试。
+// 即一条存档最多尝试 1 + maxFlushRetries 次；次数用尽后放弃并按 Dropped 上报，
+// 此时数据只剩日志里那一份（ArchiveError.Columns 带着完整内容）。
+var maxFlushRetries = 3
+
 // maxRetryBackoff 是刷盘失败重试的退避上限。
 // 退避从 FlushInterval 起按 2 的幂增长，封顶于此值。
+// 默认配置（FlushInterval=500ms、重试 3 次）下重试窗口约 3.5 秒。
 var maxRetryBackoff = 30 * time.Second
 
 var (
@@ -257,7 +263,7 @@ func (that *MySQLStore) worker(idx int) {
 			that.flush(that.queues[idx])
 		case <-that.stopCh:
 			// 关闭前最后一次刷盘，忽略退避时间，给每条存档最后一次机会
-			that.flushItems(that.queues[idx], that.queues[idx].all())
+			that.flushItems(that.queues[idx], that.queues[idx].all(), that.execItem)
 			return
 		}
 	}
@@ -265,21 +271,29 @@ func (that *MySQLStore) worker(idx int) {
 
 // flush 尝试刷盘队列中所有到期条目。
 func (that *MySQLStore) flush(q *flushQueue) {
-	that.flushItems(q, q.due(time.Now()))
+	that.flushItems(q, q.due(time.Now()), that.execItem)
 }
 
 // flushItems 逐条执行 SQL。
-// 失败的条目不会被移出队列，而是记录退避时间等下一轮重试——
-// UPSERT 与软删除都是幂等的，重复执行不会产生副作用。
-func (that *MySQLStore) flushItems(q *flushQueue, items []*pendingItem) {
+// 失败的条目留在队列里等下一轮重试——UPSERT 与软删除都是幂等的，
+// 重复执行不会产生副作用；重试次数用尽后放弃并移出队列。
+// 每次失败都会上报一次（带完整存档内容），exec 参数便于测试注入失败。
+func (that *MySQLStore) flushItems(q *flushQueue, items []*pendingItem, exec func(*pendingItem) error) {
 	for _, item := range items {
 		item.attempts++
-		err := that.execItem(item)
+		err := exec(item)
 		if err == nil {
 			q.settle(item)
 			continue
 		}
-		reportArchiveError(archiveErrorOf(item, err, false))
+
+		giveUp := item.attempts > maxFlushRetries
+		reportArchiveError(archiveErrorOf(item, err, giveUp))
+		if giveUp {
+			// 移出队列：数据不会再落库，只剩刚刚打进日志的那一份
+			q.settle(item)
+			continue
+		}
 		q.backoff(item, time.Now().Add(that.retryBackoff(item.attempts)))
 	}
 }
@@ -307,8 +321,23 @@ func archiveErrorOf(item *pendingItem, err error, dropped bool) ArchiveError {
 		Deleted: item.deleted,
 		Attempt: item.attempts,
 		Dropped: dropped,
+		Columns: columnsOf(item.meta, item.snapshot),
 		Err:     err,
 	}
+}
+
+// columnsOf 把字段快照还原成"列名 -> 值"。
+// 值就是当初要绑定给 SQL 的参数，因此日志里这份内容可以直接拿来重建 INSERT。
+// 只在存档失败时构造，不在正常刷盘路径上。
+func columnsOf(meta *TableMeta, snap []any) map[string]any {
+	cols := make(map[string]any, len(meta.Fields))
+	for i, f := range meta.Fields {
+		if i >= len(snap) {
+			break
+		}
+		cols[f.ColName] = snap[i]
+	}
+	return cols
 }
 
 // execItem 为单条 item 独立分配 5s context 并执行 SQL，
@@ -376,16 +405,17 @@ func (that *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) e
 
 // rejectIfStopped 在存储已关闭时拒收写入请求并上报。
 // 关闭后 worker 已经退出，继续入队等于静默丢档，必须让业务能感知到。
-func (that *MySQLStore) rejectIfStopped(tableName string, pk any, deleted bool) bool {
+func (that *MySQLStore) rejectIfStopped(tableName string, meta *TableMeta, snap []any, deleted bool) bool {
 	if !that.stopped.Load() {
 		return false
 	}
 	reportArchiveError(ArchiveError{
 		Table:   tableName,
-		PK:      pk,
+		PK:      snap[pkIndex(meta)],
 		Deleted: deleted,
 		Attempt: 0,
 		Dropped: true,
+		Columns: columnsOf(meta, snap),
 		Err:     errStoreStopped,
 	})
 	return true
@@ -404,7 +434,7 @@ func (that *MySQLStore) EnqueueSave(tableName string, meta *TableMeta, base unsa
 func (that *MySQLStore) EnqueueSaveSnapshot(tableName string, meta *TableMeta, snap []any) {
 	frozenMeta := freezeTableMeta(meta)
 	pk := snap[pkIndex(frozenMeta)]
-	if that.rejectIfStopped(tableName, pk, false) {
+	if that.rejectIfStopped(tableName, frozenMeta, snap, false) {
 		return
 	}
 	key := fmt.Sprintf("%s:%v", tableName, pk)
@@ -422,7 +452,7 @@ func (that *MySQLStore) EnqueueDelete(tableName string, meta *TableMeta, base un
 	frozenMeta := freezeTableMeta(meta)
 	snap := snapshotFields(frozenMeta, base)
 	pk := snap[pkIndex(frozenMeta)]
-	if that.rejectIfStopped(tableName, pk, true) {
+	if that.rejectIfStopped(tableName, frozenMeta, snap, true) {
 		return
 	}
 	key := fmt.Sprintf("%s:%v", tableName, pk)
