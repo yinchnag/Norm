@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/norm/config"
+
 	goredis "github.com/go-redis/redis/v8"
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -21,7 +23,11 @@ type Pool struct {
 var globalPool *Pool
 
 // InitPool 通过配置文件路径初始化全局连接池；应在进程启动时调用一次。
-func InitPool(cfg ORMConfiger) error {
+func InitPool(path string) error {
+	cfg, err := config.LoadFromFile(path)
+	if err != nil {
+		return fmt.Errorf("gameorm: load config: %w", err)
+	}
 	return InitPoolWithConfig(cfg)
 }
 
@@ -33,17 +39,19 @@ func InitPoolWithConfig(cfg ORMConfiger) error {
 	}
 	rdb := openRedis(cfg)
 
+	// 全局库必须连到 global_* 配置指定的地址：
+	// 这里若沿用区域 DSN，声明了 Global 的表会被静默写进区域库。
 	var globalDB *sql.DB
-	if cfg.GlobalMysqlDSN() != "" {
-		globalDB, err = openMySQL(cfg)
+	if dsn := cfg.GlobalMysqlDSN(); dsn != "" {
+		globalDB, err = openMySQLDSN(dsn, cfg)
 		if err != nil {
 			return fmt.Errorf("gameorm: open global mysql: %w", err)
 		}
 	}
 
 	var globalRedis *goredis.Client
-	if cfg.GlobalRedisAddr() != "" {
-		globalRedis = openRedis(cfg)
+	if addr := cfg.GlobalRedisAddr(); addr != "" {
+		globalRedis = openRedisAddr(addr, cfg)
 	}
 
 	globalPool = &Pool{
@@ -56,8 +64,16 @@ func InitPoolWithConfig(cfg ORMConfiger) error {
 	return nil
 }
 
+// openMySQL 按区域配置建立 MySQL 连接池。
 func openMySQL(cfg ORMConfiger) (*sql.DB, error) {
-	db, err := sql.Open("mysql", cfg.GetMysqlDSN())
+	return openMySQLDSN(cfg.GetMysqlDSN(), cfg)
+}
+
+// openMySQLDSN 用指定 DSN 建立连接池。
+// 连接数、生命周期等调优参数沿用同一份配置——ORMConfiger 目前只暴露了
+// 全局库的 DSN，其余参数无法单独配置。
+func openMySQLDSN(dsn string, cfg ORMConfiger) (*sql.DB, error) {
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -67,9 +83,16 @@ func openMySQL(cfg ORMConfiger) (*sql.DB, error) {
 	return db, nil
 }
 
+// openRedis 按区域配置建立 Redis 客户端。
 func openRedis(cfg ORMConfiger) *goredis.Client {
+	return openRedisAddr(cfg.GetRedisAddr(), cfg)
+}
+
+// openRedisAddr 用指定地址建立 Redis 客户端。
+// 密码、DB 编号、连接池参数同样沿用区域配置，原因同 openMySQLDSN。
+func openRedisAddr(addr string, cfg ORMConfiger) *goredis.Client {
 	return goredis.NewClient(&goredis.Options{
-		Addr:         cfg.GetRedisAddr(),
+		Addr:         addr,
 		Password:     cfg.GetRedisPassword(),
 		DB:           cfg.GetRedisDB(),
 		PoolSize:     cfg.GetRedisPoolSize(),
