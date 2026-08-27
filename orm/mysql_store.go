@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"reflect"
 	"strings"
@@ -260,11 +261,18 @@ func (that *MySQLStore) execSoftDelete(ctx context.Context, item *pendingItem) {
 	}
 }
 
-// EnqueueSave 将对象快照入队，不阻塞调用方。
-// workerIdx = hash(pk) % nWorker，保证同一对象始终进同一队列（顺序保证）。
+// EnqueueSave 读取对象字段快照后入队，不阻塞调用方。
 func (that *MySQLStore) EnqueueSave(tableName string, meta *TableMeta, base unsafe.Pointer) {
+	that.EnqueueSaveSnapshot(tableName, meta, snapshotFields(meta, base))
+}
+
+// EnqueueSaveSnapshot 用调用方已经算好的字段快照入队，不阻塞调用方。
+// Save() 走这条入口：快照在上层只生成一次，Redis 与 MySQL 共用同一份编码结果，
+// 复杂字段因此只经过一次 sonic 编码。
+// 入队后 snap 不再被任何一方写入，跨 goroutine 共享是安全的。
+// workerIdx = hash(pk) % nWorker，保证同一对象始终进同一队列（顺序保证）。
+func (that *MySQLStore) EnqueueSaveSnapshot(tableName string, meta *TableMeta, snap []any) {
 	frozenMeta := freezeTableMeta(meta)
-	snap := snapshotFields(frozenMeta, base)
 	pk := snap[pkIndex(frozenMeta)]
 	key := fmt.Sprintf("%s:%v", tableName, pk)
 	idx := hashKey(key) % uint64(that.nWorker)
@@ -302,6 +310,16 @@ func snapshotFields(meta *TableMeta, base unsafe.Pointer) []any {
 	return snap
 }
 
+// jsonValue 标记"已经完成 JSON 编码"的字段值。
+// readFieldValue 对复杂类型编码一次后用它包装返回，下游（Redis Hash 字段表、
+// MySQL 语句参数）凭类型断言即可识别并直接复用这串字节，无需再编码一次。
+// 用独立类型而不是 string 做标记，是为了让"已编码"由类型系统保证，
+// 避免在多处各维护一份"哪些 Kind 算复杂类型"的清单而产生漂移。
+type jsonValue string
+
+// Value 实现 driver.Valuer，使 jsonValue 可直接作为 SQL 参数传给 database/sql。
+func (that jsonValue) Value() (driver.Value, error) { return string(that), nil }
+
 // readFieldValue 通过 unsafe 指针读取字段值，返回适合 MySQL driver 的类型。
 // 基本类型通过指针直接转型（零开销）；map/slice/array/struct 等复杂类型
 // 用 sonic 序列化为 JSON 字符串，存入 JSON 列。
@@ -332,14 +350,16 @@ func readFieldValue(f *FieldMeta, ptr unsafe.Pointer) any {
 	case reflect.Bool:
 		return *(*bool)(ptr)
 	default:
-		// map / slice / array / struct → JSON 字符串存入 JSON 列
+		// map / slice / array / struct → JSON 字符串存入 JSON 列。
+		// 这是复杂字段在整条存盘链路上唯一一次 JSON 编码，结果以 jsonValue 形式
+		// 传出，Redis 写入侧直接复用，不再重复编码。
 		v := reflect.NewAt(f.GoType, ptr).Elem().Interface()
 		data, err := sonic.Marshal(v)
 		if err != nil {
 			fmt.Printf("[gameorm] marshal field %s error: %v\n", f.ColName, err)
 			return nil
 		}
-		return string(data)
+		return jsonValue(data)
 	}
 }
 

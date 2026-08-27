@@ -1,6 +1,7 @@
 package orm
 
 import (
+	"database/sql/driver"
 	"reflect"
 	"sync"
 	"testing"
@@ -127,5 +128,46 @@ func TestFreezeTableMetaCachesSingleClone(t *testing.T) {
 		if results[i] != first {
 			t.Fatal("freezeTableMeta should return same cached clone for same meta")
 		}
+	}
+}
+
+type jsonValueObj struct {
+	ID   int64            `orm:"primary,name:id"`
+	Bag  map[string]int64 `orm:"name:bag"`
+	Name string           `orm:"name:name"`
+}
+
+// TestReadFieldValueWrapsComplexAsJSONValue 复杂字段必须以 jsonValue 返回，
+// 这是下游识别"已编码"的唯一依据；基本类型必须保持原生类型。
+func TestReadFieldValueWrapsComplexAsJSONValue(t *testing.T) {
+	obj := &jsonValueObj{ID: 1, Bag: map[string]int64{"a": 1}, Name: "x"}
+	meta := GetTableMeta(reflect.TypeOf(obj))
+	snap := snapshotFields(meta, pointerOf(obj))
+
+	if _, ok := snap[0].(int64); !ok {
+		t.Errorf("基本类型不应被包装: %T", snap[0])
+	}
+	if _, ok := snap[1].(jsonValue); !ok {
+		t.Errorf("复杂字段应包装为 jsonValue: %T", snap[1])
+	}
+	if _, ok := snap[2].(string); !ok {
+		t.Errorf("string 字段应保持 string: %T", snap[2])
+	}
+}
+
+// TestJSONValueIsDriverValuer jsonValue 必须能直接作为 SQL 参数，
+// 否则 execUpsert 传参时会被 database/sql 拒绝。
+func TestJSONValueIsDriverValuer(t *testing.T) {
+	var v any = jsonValue(`{"a":1}`)
+	valuer, ok := v.(driver.Valuer)
+	if !ok {
+		t.Fatal("jsonValue 必须实现 driver.Valuer")
+	}
+	got, err := valuer.Value()
+	if err != nil {
+		t.Fatalf("Value() error: %v", err)
+	}
+	if s, ok := got.(string); !ok || s != `{"a":1}` {
+		t.Fatalf("Value() 应返回原始 JSON 文本，实际 %#v", got)
 	}
 }

@@ -22,10 +22,6 @@ var (
 	globalRedisStore  = &RedisStore{useGlobal: true}
 )
 
-func getRedisStore() *RedisStore {
-	return getRedisStoreForRoute(false)
-}
-
 func getRedisStoreForRoute(useGlobal bool) *RedisStore {
 	if useGlobal {
 		globalRedisStore.pool = GetPool()
@@ -41,12 +37,19 @@ func redisKey(tableName string, pk any) string {
 }
 
 // Set 将对象按字段写入 Redis Hash，TTL 从全局配置读取。
+// 对象级入口：内部先做一次字段快照，再交给 SetSnapshot。
 func (that *RedisStore) Set(ctx context.Context, tableName string, pk any, obj any) error {
 	meta := GetTableMeta(reflect.TypeOf(obj))
-	base := pointerOf(obj)
-	fields, err := buildRedisHashFields(meta, base)
+	return that.SetSnapshot(ctx, tableName, pk, meta, snapshotFields(meta, pointerOf(obj)))
+}
+
+// SetSnapshot 用调用方已经算好的字段快照写入 Redis Hash。
+// 快照中的复杂字段已由 readFieldValue 编码为 jsonValue，这里直接复用那串字节，
+// 因此 Save() 一次调用里复杂字段只会被 sonic 编码一次（Redis 与 MySQL 共用）。
+func (that *RedisStore) SetSnapshot(ctx context.Context, tableName string, pk any, meta *TableMeta, snap []any) error {
+	fields, err := buildRedisHashFieldsFromSnapshot(meta, snap)
 	if err != nil {
-		return fmt.Errorf("redisStore.Set build hash fields: %w", err)
+		return fmt.Errorf("redisStore.SetSnapshot build hash fields: %w", err)
 	}
 
 	key := redisKey(tableName, pk)
@@ -84,12 +87,23 @@ func (that *RedisStore) Del(ctx context.Context, tableName string, pk any) error
 	return that.pool.SelectRedis(that.useGlobal).Del(ctx, redisKey(tableName, pk)).Err()
 }
 
-func buildRedisHashFields(meta *TableMeta, base unsafe.Pointer) (map[string]interface{}, error) {
+// buildRedisHashFieldsFromSnapshot 把字段快照转换成 Redis Hash 字段表。
+//
+// 快照里有两类值：
+//   - jsonValue —— 复杂字段，readFieldValue 已经编码好，直接复用（省掉重复的一次 Marshal）
+//   - 基本类型原生值 —— 仍编码为 JSON 文本，保持与 applyRedisHashFields 的读侧解码对称
+func buildRedisHashFieldsFromSnapshot(meta *TableMeta, snap []any) (map[string]interface{}, error) {
 	fields := make(map[string]interface{}, len(meta.Fields))
-	for _, f := range meta.Fields {
-		ptr := FieldPtr(base, f.Offset)
-		v := reflect.NewAt(f.GoType, ptr).Elem().Interface()
-		data, err := sonic.Marshal(v)
+	for i, f := range meta.Fields {
+		if jv, ok := snap[i].(jsonValue); ok {
+			fields[f.ColName] = string(jv)
+			continue
+		}
+		if snap[i] == nil {
+			// readFieldValue 编码失败时才会返回 nil（已打日志），此处不静默写脏数据
+			return nil, fmt.Errorf("field=%s: nil snapshot value (marshal failed)", f.ColName)
+		}
+		data, err := sonic.Marshal(snap[i])
 		if err != nil {
 			return nil, fmt.Errorf("field=%s marshal: %w", f.ColName, err)
 		}

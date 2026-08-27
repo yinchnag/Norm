@@ -167,15 +167,18 @@ func (that *TableSchema[T]) Save() {
 	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
 	useGlobal := that.useGlobalStorage()
 
+	// 字段快照只生成一次：复杂字段的 JSON 编码结果由下面两条路径共用，
+	// 避免同一份数据被 sonic 编码两遍。快照生成后不再被修改，共享是安全的。
+	snap := snapshotFields(that.meta, that.selfPtr)
+
 	// 1. 同步写 Redis 热缓存
 	rds := getRedisStoreForRoute(useGlobal)
-	hostObj := that.hostInterface()
-	if err := rds.Set(ctx, that.meta.TableName, pk, hostObj); err != nil {
+	if err := rds.SetSnapshot(ctx, that.meta.TableName, pk, that.meta, snap); err != nil {
 		fmt.Printf("[gameorm] Save redis error [%s:%v]: %v\n", that.meta.TableName, pk, err)
 	}
 
 	// 2. 异步入队 MySQL 存盘（不阻塞游戏逻辑）
-	getMySQLStoreForRoute(useGlobal).EnqueueSave(that.meta.TableName, that.meta, that.selfPtr)
+	getMySQLStoreForRoute(useGlobal).EnqueueSaveSnapshot(that.meta.TableName, that.meta, snap)
 }
 
 // SaveR 仅将宿主对象写入 Redis，不提交 MySQL 异步存盘。
@@ -184,10 +187,10 @@ func (that *TableSchema[T]) SaveR() {
 	that.mustInit()
 	ctx := context.Background()
 	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
-	hostObj := that.hostInterface()
 	useGlobal := that.useGlobalStorage()
+	snap := snapshotFields(that.meta, that.selfPtr)
 
-	if err := getRedisStoreForRoute(useGlobal).Set(ctx, that.meta.TableName, pk, hostObj); err != nil {
+	if err := getRedisStoreForRoute(useGlobal).SetSnapshot(ctx, that.meta.TableName, pk, that.meta, snap); err != nil {
 		fmt.Printf("[gameorm] SaveR redis error [%s:%v]: %v\n", that.meta.TableName, pk, err)
 	}
 }
@@ -249,11 +252,8 @@ func (that *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *Redi
 	}
 	// 将扫描结果回写到字段
 	writeScanResultsToFields(meta, that.selfPtr, scanTargets)
-	// 回写 Redis
-	hostObj := that.hostInterface()
-	ttl := getRedisStore().pool
-	_ = ttl
-	if err := rds.Set(ctx, meta.TableName, pk, hostObj); err != nil {
+	// 回写 Redis：复用刚扫描出来的字段值，与 Save() 走同一条快照入口
+	if err := rds.SetSnapshot(ctx, meta.TableName, pk, meta, snapshotFields(meta, that.selfPtr)); err != nil {
 		fmt.Printf("[gameorm] Load redis set-back error: %v\n", err)
 	}
 	return nil
