@@ -1,7 +1,6 @@
 package orm
 
 import (
-	"errors"
 	"fmt"
 	"sync/atomic"
 
@@ -80,11 +79,10 @@ func SetArchiveErrorHandler(fn func(ArchiveError)) {
 	archiveErrorHook.Store(&fn)
 }
 
-// errStoreStopped 表示存储已关闭，新的写入请求不会被处理。
-var errStoreStopped = errors.New("mysql store already stopped")
-
 // errNotFlushed 表示进程退出时该条存档仍未落库。
-var errNotFlushed = errors.New("not flushed before shutdown")
+// 挂在 ErrStoreStopped 之下，业务回调里可用 errors.Is 把"存储已停止导致的丢档"
+// 与"MySQL 拒绝了这次写入"区分开。
+var errNotFlushed = fmt.Errorf("%w: not flushed before shutdown", ErrStoreStopped)
 
 // reportArchiveError 把一次存档失败交给业务回调。
 // 回调 panic 不会影响刷盘 worker——存档链路不能因为告警代码出错而中断。

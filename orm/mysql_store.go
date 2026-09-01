@@ -416,7 +416,7 @@ func (that *MySQLStore) rejectIfStopped(tableName string, meta *TableMeta, snap 
 		Attempt: 0,
 		Dropped: true,
 		Columns: columnsOf(meta, snap),
-		Err:     errStoreStopped,
+		Err:     ErrStoreStopped,
 	})
 	return true
 }

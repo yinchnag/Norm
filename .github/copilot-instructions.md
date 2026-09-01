@@ -40,7 +40,7 @@ gameorm/
 │   ├── config.go
 │   └── config_test.go
 └── orm/
-    ├── errors.go          # 包级错误常量
+    ├── errors.go          # 错误类别哨兵 + *Error 上下文载体
     ├── field_meta.go      # struct tag 解析 + FieldMeta/TableMeta + unsafe 偏移工具
     ├── field_meta_test.go
     ├── pool.go            # MySQL/Redis 连接池单例
@@ -208,7 +208,15 @@ type scanTarget struct {
 - UPSERT 的 UPDATE 子句追加 `is_deleted=0, update_time=NOW()`（恢复已删记录）
 
 ### 错误处理
-- 存档失败**不 panic、不阻塞**：打印日志后等下次 flush 重试
+- 对外错误一律用 `orm/errors.go` 的 `*Error`（类别哨兵 + Op/Table/Column/PK），**禁止裸 `fmt.Errorf`**
+- 判定用 `errors.Is(err, orm.ErrNotFound)`，取上下文用 `errors.As(err, &e)`，**禁止匹配错误消息文本**
+- 类别只有六个：`ErrNotFound` / `ErrNotInitialized` / `ErrStoreStopped` / `ErrSchema` / `ErrCodec` / `ErrBackend`。
+  新增前先问一句"业务或监控会因为它做出不同的动作吗"，答案是否就并入已有类别
+- **一条链路只允许存在一个 `*Error`**：内层在失败现场标注 Kind 与列名，外层用 `withContext` 补表名、主键
+  并把操作名拼成 `LoadR/Unmarshal` 这样的路径；绝不把 `*Error` 再包进另一个 `*Error`
+  （否则消息里会出现两遍 `gameorm:` 前缀和两遍表名）
+- `*Error` 用 `Unwrap() []error` 同时暴露类别与底层错误，业务判类别、排障看驱动细节两不误
+- 存档失败**不 panic、不阻塞**：重试，超过上限后通过 `ArchiveError` 回调上报完整存档内容
 - `Load` 失败返回 `error`，由调用方决策
 - **`Init()` 在 `AutoMigrate` 失败时 panic**（开发期快速失败，避免无表静默运行）
 

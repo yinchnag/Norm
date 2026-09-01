@@ -314,7 +314,7 @@ func TestEnqueueAfterStopIsReported(t *testing.T) {
 		t.Fatalf("关闭后入队应上报 1 条，实际 %d", len(*events))
 	}
 	ev := (*events)[0]
-	if !ev.Dropped || !errors.Is(ev.Err, errStoreStopped) {
+	if !ev.Dropped || !errors.Is(ev.Err, ErrStoreStopped) {
 		t.Fatalf("事件内容不符: %+v", ev)
 	}
 	// 这条数据不会落库，日志必须带着完整内容

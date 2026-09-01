@@ -49,6 +49,7 @@ FindAll() -> MySQL SELECT with auto is_deleted=0 filter
   - `ddl_builder.go` -- AutoMigrate: CREATE TABLE IF NOT EXISTS + ALTER TABLE ADD COLUMN
   - `query_builder.go` -- generic `QueryBuilder[T]` with NULL-safe scanning via `sql.Null*` types
   - `pool.go` -- MySQL/Redis connection pool singleton (regional + optional global)
+  - `errors.go` -- error Kind sentinels + `*Error` context carrier (`newError` / `withContext` / `KindOf`)
 - **`config/`** -- JSON config loading (`ORMConfig` struct)
 
 ### MySQL Write Pipeline
@@ -70,7 +71,10 @@ Every table gets `is_deleted`, `create_time`, `update_time` plus indexes `idx_is
 - One main struct per file with matching `_test.go`
 - `sync.Map` for metadata caching; `sync.Mutex` in flushQueue; `sync.Once` for worker startup
 - No physical DELETE -- always soft delete; UPSERT resets `is_deleted=0`
-- `Init()` panics on AutoMigrate failure (fast-fail); `Save` failures log and retry; `Load` failures return error
+- All outward-facing errors are `*Error` from `orm/errors.go` (Kind sentinel + Op/Table/Column/PK) -- never a bare `fmt.Errorf`
+- Judge errors with `errors.Is(err, orm.ErrNotFound)` / `errors.As(err, &e)`; never match message text
+- Only one `*Error` per chain: inner layers tag Kind + Column at the failure site, outer layers call `withContext` to fill Table/PK and prepend the op name -- never wrap an `*Error` inside another
+- `Init()` panics on AutoMigrate failure (fast-fail); `Save` failures retry then surface via the `ArchiveError` callback; `Load` failures return error
 - TEXT/BLOB/JSON columns must not have DEFAULT clauses
 - Do not use `gorm` or other third-party ORMs
 - Do not use `time.Sleep` or blocking waits in the MySQL write path

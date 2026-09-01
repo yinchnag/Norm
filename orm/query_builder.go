@@ -81,7 +81,7 @@ func (that *QueryBuilder[T]) FindAll(ctx context.Context) ([]T, error) {
 
 	rows, err := that.db.QueryContext(ctx, sb.String())
 	if err != nil {
-		return nil, fmt.Errorf("FindAll query: %w", err)
+		return nil, newError("FindAll", that.meta.TableName, nil, nil, err)
 	}
 	defer rows.Close()
 
@@ -102,13 +102,18 @@ func (that *QueryBuilder[T]) FindAll(ctx context.Context) ([]T, error) {
 
 		scanDest, scanTargets := makeScanDest(that.meta, base)
 		if err = rows.Scan(scanDest...); err != nil {
-			return nil, fmt.Errorf("FindAll scan: %w", err)
+			// 扫描失败是列值与字段类型对不上，属于数据转换问题而非后端故障
+			return nil, newError("FindAll", that.meta.TableName, nil, ErrCodec, err)
 		}
 		// 将扫描结果从 sql.Null* 缓冲回写到原字段
 		writeScanResultsToFields(that.meta, base, scanTargets)
 		results = append(results, objPtr.Interface().(T))
 	}
-	return results, rows.Err()
+	// 迭代过程中的连接错误只会从 rows.Err() 暴露，不能直接透传给业务
+	if err := rows.Err(); err != nil {
+		return nil, newError("FindAll", that.meta.TableName, nil, nil, err)
+	}
+	return results, nil
 }
 
 // scanTarget 是一个临时缓冲对象，用于安全地扫描可能为 NULL 的值。

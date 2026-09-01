@@ -3,17 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -725,24 +726,45 @@ func (c *errorCollector) snapshot() stageErrorInfo {
 	}
 }
 
+// classifyError 把错误归入监控分桶。
+//
+// 改造前这里靠 strings.Contains 猜错误类型——错误消息一改措辞，分桶就悄悄失准。
+// 现在直接问 orm.KindOf，分桶不再依赖消息文本。
 func classifyError(err error) string {
-	msg := strings.ToLower(err.Error())
-	switch {
-	case errors.Is(err, sql.ErrNoRows) || strings.Contains(msg, "no rows"):
-		return "mysql_not_found"
-	case strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline"):
-		return "timeout"
-	case strings.Contains(msg, "connection") || strings.Contains(msg, "broken pipe"):
-		return "connection_error"
-	case strings.Contains(msg, "redis"):
-		return "redis_error"
-	case strings.Contains(msg, "mysql"):
-		return "mysql_error"
-	case strings.Contains(msg, "scan") || strings.Contains(msg, "unmarshal"):
+	switch orm.KindOf(err) {
+	case nil:
+		return "none"
+	case orm.ErrNotFound:
+		return "not_found"
+	case orm.ErrNotInitialized:
+		return "not_initialized"
+	case orm.ErrStoreStopped:
+		return "store_stopped"
+	case orm.ErrSchema:
+		return "schema_error"
+	case orm.ErrCodec:
 		return "decode_scan_error"
 	default:
-		return "other"
+		// ErrBackend 是框架的兜底类别，对压测报表来说太粗：
+		// 超时意味着要扩容或降级，连接断开是基础设施故障，两者的处置动作不同。
+		return backendDetail(err)
 	}
+}
+
+// backendDetail 把 ErrBackend 再细分一层，同样只做类型判定，不看错误消息文本。
+func backendDetail(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) || errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) {
+		return "connection_error"
+	}
+	return "backend_error"
 }
 
 func cloneErrMap(src map[string]int64) map[string]int64 {

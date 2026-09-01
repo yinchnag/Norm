@@ -23,14 +23,20 @@ func newDDLBuilderWithDB(db *sql.DB) *DDLBuilder {
 
 // AutoMigrate 确保表存在且所有字段列存在。
 // 不会删除旧列，不会修改列类型（安全迁移原则）。
+//
+// 这里是 schema 子系统的错误边界：内部各步返回的裸驱动错误在这一层统一
+// 补上表名并归入 ErrSchema，调用方拿到的一定是可判定的 *Error，无需再包装。
 func (that *DDLBuilder) AutoMigrate(ctx context.Context, meta *TableMeta) error {
 	if err := that.createTableIfNotExists(ctx, meta); err != nil {
-		return err
+		return withContext("AutoMigrate", meta.TableName, nil, ErrSchema, err)
 	}
 	if err := that.addMissingColumns(ctx, meta); err != nil {
-		return err
+		return withContext("AutoMigrate", meta.TableName, nil, ErrSchema, err)
 	}
-	return that.ensureIndexes(ctx, meta)
+	if err := that.ensureIndexes(ctx, meta); err != nil {
+		return withContext("AutoMigrate", meta.TableName, nil, ErrSchema, err)
+	}
+	return nil
 }
 
 func (that *DDLBuilder) createTableIfNotExists(ctx context.Context, meta *TableMeta) error {
@@ -92,7 +98,8 @@ func (that *DDLBuilder) addMissingColumns(ctx context.Context, meta *TableMeta) 
 			meta.TableName, buildColumnDef(f),
 		)
 		if _, err = that.db.ExecContext(ctx, alterSQL); err != nil {
-			return fmt.Errorf("addMissingColumns [%s.%s]: %w", meta.TableName, f.ColName, err)
+			// 表名留给 AutoMigrate 补，这里只标注是补哪一列失败
+			return &Error{Op: "AddColumn", Column: f.ColName, Kind: ErrSchema, Err: err}
 		}
 	}
 
@@ -102,7 +109,7 @@ func (that *DDLBuilder) addMissingColumns(ctx context.Context, meta *TableMeta) 
 		}
 		alterSQL := fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN %s", meta.TableName, def)
 		if _, err = that.db.ExecContext(ctx, alterSQL); err != nil {
-			return fmt.Errorf("addMissingColumns [%s.%s]: %w", meta.TableName, col, err)
+			return &Error{Op: "AddColumn", Column: col, Kind: ErrSchema, Err: err}
 		}
 	}
 	return nil
@@ -183,7 +190,7 @@ func (that *DDLBuilder) ensureIndexes(ctx context.Context, meta *TableMeta) erro
 	for _, name := range toDrop {
 		sql := fmt.Sprintf("DROP INDEX `%s` ON `%s`", name, meta.TableName)
 		if _, err = that.db.ExecContext(ctx, sql); err != nil {
-			return fmt.Errorf("ensureIndexes drop [%s.%s]: %w", meta.TableName, name, err)
+			return &Error{Op: "DropIndex", Column: name, Kind: ErrSchema, Err: err}
 		}
 	}
 
@@ -195,7 +202,7 @@ func (that *DDLBuilder) ensureIndexes(ctx context.Context, meta *TableMeta) erro
 		sql := fmt.Sprintf("CREATE INDEX `%s` ON `%s` (%s)",
 			name, meta.TableName, strings.Join(quoted, ","))
 		if _, err = that.db.ExecContext(ctx, sql); err != nil {
-			return fmt.Errorf("ensureIndexes [%s.%s]: %w", meta.TableName, name, err)
+			return &Error{Op: "CreateIndex", Column: name, Kind: ErrSchema, Err: err}
 		}
 	}
 	return nil

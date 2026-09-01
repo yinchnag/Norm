@@ -2,7 +2,6 @@ package orm
 
 import (
 	"database/sql"
-	"fmt"
 	"time"
 
 	"github.com/norm/config"
@@ -26,7 +25,8 @@ var globalPool *Pool
 func InitPool(path string) error {
 	cfg, err := config.LoadFromFile(path)
 	if err != nil {
-		return fmt.Errorf("gameorm: load config: %w", err)
+		// 初始化的任何一步失败，结论都是"池子没起来"，业务只需判这一个类别
+		return newError("LoadConfig", "", nil, ErrNotInitialized, err)
 	}
 	return InitPoolWithConfig(cfg)
 }
@@ -35,7 +35,7 @@ func InitPool(path string) error {
 func InitPoolWithConfig(cfg ORMConfiger) error {
 	db, err := openMySQL(cfg)
 	if err != nil {
-		return fmt.Errorf("gameorm: open mysql: %w", err)
+		return newError("OpenMySQL", "", nil, ErrNotInitialized, err)
 	}
 	rdb := openRedis(cfg)
 
@@ -45,7 +45,7 @@ func InitPoolWithConfig(cfg ORMConfiger) error {
 	if dsn := cfg.GlobalMysqlDSN(); dsn != "" {
 		globalDB, err = openMySQLDSN(dsn, cfg)
 		if err != nil {
-			return fmt.Errorf("gameorm: open global mysql: %w", err)
+			return newError("OpenGlobalMySQL", "", nil, ErrNotInitialized, err)
 		}
 	}
 

@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -49,7 +50,8 @@ func (that *RedisStore) Set(ctx context.Context, tableName string, pk any, obj a
 func (that *RedisStore) SetSnapshot(ctx context.Context, tableName string, pk any, meta *TableMeta, snap []any) error {
 	fields, err := buildRedisHashFieldsFromSnapshot(meta, snap)
 	if err != nil {
-		return fmt.Errorf("redisStore.SetSnapshot build hash fields: %w", err)
+		// 下层已带好列名与 ErrCodec，这里只补表名和主键
+		return withContext("", tableName, pk, nil, err)
 	}
 
 	key := redisKey(tableName, pk)
@@ -59,8 +61,10 @@ func (that *RedisStore) SetSnapshot(ctx context.Context, tableName string, pk an
 	pipe := client.TxPipeline()
 	pipe.HSet(ctx, key, fields)
 	pipe.Expire(ctx, key, ttl)
-	_, err = pipe.Exec(ctx)
-	return err
+	if _, err = pipe.Exec(ctx); err != nil {
+		return newError("SetSnapshot", tableName, pk, nil, err)
+	}
+	return nil
 }
 
 // Get 从 Redis Hash 读取对象；key 不存在时返回 goredis.Nil。
@@ -77,7 +81,7 @@ func (that *RedisStore) Get(ctx context.Context, tableName string, pk any, dest 
 	meta := GetTableMeta(reflect.TypeOf(dest))
 	base := pointerOf(dest)
 	if err := applyRedisHashFields(meta, base, vals); err != nil {
-		return fmt.Errorf("redisStore.Get apply hash fields: %w", err)
+		return withContext("", tableName, pk, nil, err)
 	}
 	return nil
 }
@@ -101,11 +105,12 @@ func buildRedisHashFieldsFromSnapshot(meta *TableMeta, snap []any) (map[string]i
 		}
 		if snap[i] == nil {
 			// readFieldValue 编码失败时才会返回 nil（已打日志），此处不静默写脏数据
-			return nil, fmt.Errorf("field=%s: nil snapshot value (marshal failed)", f.ColName)
+			return nil, &Error{Op: "Marshal", Column: f.ColName, Kind: ErrCodec,
+				Err: errors.New("nil snapshot value (marshal failed)")}
 		}
 		data, err := sonic.Marshal(snap[i])
 		if err != nil {
-			return nil, fmt.Errorf("field=%s marshal: %w", f.ColName, err)
+			return nil, &Error{Op: "Marshal", Column: f.ColName, Kind: ErrCodec, Err: err}
 		}
 		fields[f.ColName] = string(data)
 	}
@@ -121,7 +126,7 @@ func applyRedisHashFields(meta *TableMeta, base unsafe.Pointer, values map[strin
 		ptr := FieldPtr(base, f.Offset)
 		target := reflect.NewAt(f.GoType, ptr).Interface()
 		if err := sonic.Unmarshal([]byte(raw), target); err != nil {
-			return fmt.Errorf("field=%s unmarshal: %w", f.ColName, err)
+			return &Error{Op: "Unmarshal", Column: f.ColName, Kind: ErrCodec, Err: err}
 		}
 	}
 	return nil
@@ -130,11 +135,6 @@ func applyRedisHashFields(meta *TableMeta, base unsafe.Pointer, values map[strin
 // SetRaw 直接写入 JSON bytes，供批量刷盘使用，避免二次序列化。
 func (that *RedisStore) SetRaw(ctx context.Context, key string, data []byte, ttl time.Duration) error {
 	return that.pool.SelectRedis(that.useGlobal).Set(ctx, key, data, ttl).Err()
-}
-
-// IsNotFound 判断 Redis 错误是否为 key 不存在。
-func IsNotFound(err error) bool {
-	return err == goredis.Nil
 }
 
 // pointerOf 将任意指针类型转换为 unsafe.Pointer，用于字段偏移运算。

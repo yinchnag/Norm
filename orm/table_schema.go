@@ -197,6 +197,9 @@ func (that *TableSchema[T]) SaveR() {
 
 // Load 按主键从 Redis 读取对象；Redis 未命中时降级读 MySQL，并回写 Redis。
 // 结果直接写入宿主对象字段（通过指针偏移），无额外分配。
+//
+// 两级存储都没有这条数据时，返回的错误满足 IsNotFound(err)；
+// 其余失败可用 errors.As 取出 *Error，拿到表名、主键与错误类别。
 func (that *TableSchema[T]) Load() error {
 	that.mustInit()
 	ctx := context.Background()
@@ -214,12 +217,13 @@ func (that *TableSchema[T]) Load() error {
 
 	// 2. Redis 未命中，查 MySQL
 	if globalPool == nil {
-		return fmt.Errorf("gameorm: pool not initialized")
+		return newError("Load", that.meta.TableName, pk, ErrNotInitialized, nil)
 	}
 	return that.loadFromMySQL(ctx, pk, rds, useGlobal)
 }
 
 // LoadR 仅从 Redis 加载对象，不会降级查询 MySQL。
+// 缓存未命中返回的错误同样满足 IsNotFound(err)，与 Load 的判定方式一致。
 func (that *TableSchema[T]) LoadR() error {
 	that.mustInit()
 	ctx := context.Background()
@@ -228,7 +232,11 @@ func (that *TableSchema[T]) LoadR() error {
 	useGlobal := that.useGlobalStorage()
 
 	if err := getRedisStoreForRoute(useGlobal).Get(ctx, that.meta.TableName, pk, hostObj); err != nil {
-		return fmt.Errorf("gameorm: LoadR [%s:%v] redis: %w", that.meta.TableName, pk, err)
+		// 类别交给 KindOf 推断：Redis 的 key 不存在会被归一成 ErrNotFound，
+		// 与 Load 走 MySQL 查不到行时的类别一致，业务只需判一种。
+		// 用 withContext 而非 newError：解码失败时下层已经带好列名与 ErrCodec，
+		// 这里只补表名、主键与操作名，不再套一层。
+		return withContext("LoadR", that.meta.TableName, pk, nil, err)
 	}
 	return nil
 }
@@ -248,7 +256,8 @@ func (that *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *Redi
 	row := db.QueryRowContext(ctx, query, pk)
 	scanDest, scanTargets := makeScanDest(meta, that.selfPtr)
 	if err := row.Scan(scanDest...); err != nil {
-		return fmt.Errorf("gameorm: Load [%s:%v] mysql: %w", meta.TableName, pk, err)
+		// sql.ErrNoRows 会被 KindOf 归一成 ErrNotFound，其余归入 ErrBackend
+		return newError("Load", meta.TableName, pk, nil, err)
 	}
 	// 将扫描结果回写到字段
 	writeScanResultsToFields(meta, that.selfPtr, scanTargets)
@@ -291,6 +300,7 @@ func (that *TableSchema[T]) FindAll(cond, orderBy string, limit int) ([]T, error
 func (that *TableSchema[T]) Migrate() error {
 	that.mustInit()
 	useGlobal := that.useGlobalStorage()
+	// AutoMigrate 内部已产出带表名与 ErrSchema 的 *Error，直接透传，不再包一层
 	return newDDLBuilderWithDB(GetPool().SelectMySQL(useGlobal)).AutoMigrate(context.Background(), that.meta)
 }
 
