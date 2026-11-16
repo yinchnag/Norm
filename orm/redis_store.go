@@ -67,6 +67,27 @@ func (that *RedisStore) SetSnapshot(ctx context.Context, tableName string, pk an
 	return nil
 }
 
+func (that *RedisStore) SetSnapshotArgs(ctx context.Context, tableName string, pk any, meta *TableMeta, snap []any) error {
+	args, err := buildRedisHashArgsFromSnapshot(meta, snap)
+	if err != nil {
+		return withContext("", tableName, pk, nil, err)
+	}
+
+	key := redisKey(tableName, pk)
+	cfg := that.pool.SelectRedisConfig(that.useGlobal)
+	ttl := time.Duration(cfg.GetRedisKeyTTLSec()) * time.Second
+	client := that.pool.SelectRedis(that.useGlobal)
+
+	pipe := client.TxPipeline()
+	pipe.HSet(ctx, key, args...)
+	pipe.Expire(ctx, key, ttl)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return newError("SetSnapshotArgs", tableName, pk, nil, err)
+	}
+	return nil
+}
+
 // Get 从 Redis Hash 读取对象；key 不存在时返回 goredis.Nil。
 func (that *RedisStore) Get(ctx context.Context, tableName string, pk any, dest any) error {
 	key := redisKey(tableName, pk)
@@ -105,8 +126,10 @@ func buildRedisHashFieldsFromSnapshot(meta *TableMeta, snap []any) (map[string]i
 		}
 		if snap[i] == nil {
 			// readFieldValue 编码失败时才会返回 nil（已打日志），此处不静默写脏数据
-			return nil, &Error{Op: "Marshal", Column: f.ColName, Kind: ErrCodec,
-				Err: errors.New("nil snapshot value (marshal failed)")}
+			return nil, &Error{
+				Op: "Marshal", Column: f.ColName, Kind: ErrCodec,
+				Err: errors.New("nil snapshot value (marshal failed)"),
+			}
 		}
 		data, err := sonic.Marshal(snap[i])
 		if err != nil {
@@ -115,6 +138,106 @@ func buildRedisHashFieldsFromSnapshot(meta *TableMeta, snap []any) (map[string]i
 		fields[f.ColName] = string(data)
 	}
 	return fields, nil
+}
+
+func buildRedisHashArgsFromSnapshot(meta *TableMeta, snap []any) ([]any, error) {
+	args := make([]any, 0, len(meta.Fields)*2)
+
+	for i, f := range meta.Fields {
+		var value any
+
+		if jv, ok := snap[i].(jsonValue); ok {
+			// 复杂的字段在快照阶段已经编码，不重复编码
+			value = string(jv)
+		} else {
+			if snap[i] == nil {
+				return nil, &Error{
+					Op:     "Marshal",
+					Column: f.ColName,
+					Kind:   ErrCodec,
+					Err:    errors.New("nil snapshot value (marshal failed)"),
+				}
+			}
+
+			data, err := sonic.Marshal(snap[i])
+			if err != nil {
+				return nil, &Error{
+					Op:     "Marshal",
+					Column: f.ColName,
+					Kind:   ErrCodec,
+					Err:    err,
+				}
+			}
+			value = data
+		}
+		args = append(args, f.ColName, value)
+	}
+	return args, nil
+}
+
+func buildRedisHSetArgs(key string, meta *TableMeta, base unsafe.Pointer) ([]any, error) {
+	args := make([]any, 2, 2+len(meta.Fields)*2)
+	args[0] = "hset"
+	args[1] = key
+
+	for _, f := range meta.Fields {
+		ptr := FieldPtr(base, f.Offset)
+		v := readFieldValue(f, ptr)
+
+		if v == nil {
+			return nil, &Error{
+				Op:     "Marshal",
+				Column: f.ColName,
+				Kind:   ErrCodec,
+				Err:    errors.New("nil snapshot value (marshal failed)"),
+			}
+		}
+
+		var encoded any
+		if jv, ok := v.(jsonValue); ok {
+			encoded = string(jv)
+		} else {
+			data, err := sonic.Marshal(v)
+			if err != nil {
+				return nil, &Error{
+					Op:     "Marshal",
+					Column: f.ColName,
+					Kind:   ErrCodec,
+					Err:    err,
+				}
+			}
+			encoded = data
+		}
+		args = append(args, f.ColName, encoded)
+	}
+	return args, nil
+}
+
+func (that *RedisStore) SetFields(ctx context.Context, tableName string, pk any, meta *TableMeta, base unsafe.Pointer) error {
+	key := redisKey(tableName, pk)
+	args, err := buildRedisHSetArgs(key, meta, base)
+	if err != nil {
+		return withContext("SetFields", tableName, pk, nil, err)
+	}
+
+	cfg := that.pool.SelectRedisConfig(that.useGlobal)
+	ttl := time.Duration(cfg.GetRedisKeyTTLSec()) * time.Second
+	client := that.pool.SelectRedis(that.useGlobal)
+
+	pipe := client.TxPipeline()
+	defer pipe.Close()
+
+	// args 已包含命令名和 key，直接构造命令，避免 HSet 再建切片。
+	cmd := goredis.NewIntCmd(ctx, args...)
+	if err := pipe.Process(ctx, cmd); err != nil {
+		return newError("SetFields", tableName, pk, nil, err)
+	}
+	pipe.Expire(ctx, key, ttl)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return newError("SetFields", tableName, pk, nil, err)
+	}
+	return nil
 }
 
 func applyRedisHashFields(meta *TableMeta, base unsafe.Pointer, values map[string]string) error {

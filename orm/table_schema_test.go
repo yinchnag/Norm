@@ -91,8 +91,8 @@ func TestTableSchema_MustInitPanic(t *testing.T) {
 
 func TestTableSchema_SaveR_MustInitPanic(t *testing.T) {
 	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic when calling SaveR without Init")
+		if got := recover(); got != "gameorm: Init() must be called before any ORM operation" {
+			t.Fatalf("unexpected panic: %v", got)
 		}
 	}()
 	u := &TestUser{}
@@ -101,14 +101,13 @@ func TestTableSchema_SaveR_MustInitPanic(t *testing.T) {
 
 func TestTableSchema_LoadR_MustInitPanic(t *testing.T) {
 	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic when calling LoadR without Init")
+		if got := recover(); got != "gameorm: Init() must be called before any ORM operation" {
+			t.Fatalf("unexpected panic: %v", got)
 		}
 	}()
 	u := &TestUser{}
 	_ = u.LoadR()
 }
-
 func TestTableSchema_UseGlobalStorageByField(t *testing.T) {
 	initialGlobalPool := globalPool
 	globalPool = nil

@@ -185,13 +185,20 @@ func (that *TableSchema[T]) Save() {
 // 适用于临时态/会话态等无需落盘 MySQL 的数据。
 func (that *TableSchema[T]) SaveR() {
 	that.mustInit()
+
 	ctx := context.Background()
 	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
 	useGlobal := that.useGlobalStorage()
-	snap := snapshotFields(that.meta, that.selfPtr)
 
-	if err := getRedisStoreForRoute(useGlobal).SetSnapshot(ctx, that.meta.TableName, pk, that.meta, snap); err != nil {
-		fmt.Printf("[gameorm] SaveR redis error [%s:%v]: %v\n", that.meta.TableName, pk, err)
+	if err := getRedisStoreForRoute(useGlobal).SetFields(
+		ctx,
+		that.meta.TableName,
+		pk,
+		that.meta,
+		that.selfPtr,
+	); err != nil {
+		fmt.Printf("[gameorm] SaveR redis error [%s:%v]: %v\n",
+			that.meta.TableName, pk, err)
 	}
 }
 
