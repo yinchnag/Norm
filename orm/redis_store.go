@@ -48,6 +48,12 @@ func (that *RedisStore) Set(ctx context.Context, tableName string, pk any, obj a
 // 快照中的复杂字段已由 readFieldValue 编码为 jsonValue，这里直接复用那串字节，
 // 因此 Save() 一次调用里复杂字段只会被 sonic 编码一次（Redis 与 MySQL 共用）。
 func (that *RedisStore) SetSnapshot(ctx context.Context, tableName string, pk any, meta *TableMeta, snap []any) error {
+	ctx, done, err := that.pool.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	fields, err := buildRedisHashFieldsFromSnapshot(meta, snap)
 	if err != nil {
 		// 下层已带好列名与 ErrCodec，这里只补表名和主键
@@ -68,6 +74,12 @@ func (that *RedisStore) SetSnapshot(ctx context.Context, tableName string, pk an
 }
 
 func (that *RedisStore) SetSnapshotArgs(ctx context.Context, tableName string, pk any, meta *TableMeta, snap []any) error {
+	ctx, done, err := that.pool.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	args, err := buildRedisHashArgsFromSnapshot(meta, snap)
 	if err != nil {
 		return withContext("", tableName, pk, nil, err)
@@ -109,6 +121,12 @@ func (that *RedisStore) Get(ctx context.Context, tableName string, pk any, dest 
 
 // Del 从 Redis 删除对象缓存。
 func (that *RedisStore) Del(ctx context.Context, tableName string, pk any) error {
+	ctx, done, err := that.pool.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	return that.pool.SelectRedis(that.useGlobal).Del(ctx, redisKey(tableName, pk)).Err()
 }
 
@@ -214,6 +232,12 @@ func buildRedisHSetArgs(key string, meta *TableMeta, base unsafe.Pointer) ([]any
 }
 
 func (that *RedisStore) SetFields(ctx context.Context, tableName string, pk any, meta *TableMeta, base unsafe.Pointer) error {
+	ctx, done, err := that.pool.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	key := redisKey(tableName, pk)
 	args, err := buildRedisHSetArgs(key, meta, base)
 	if err != nil {
@@ -257,6 +281,12 @@ func applyRedisHashFields(meta *TableMeta, base unsafe.Pointer, values map[strin
 
 // SetRaw 直接写入 JSON bytes，供批量刷盘使用，避免二次序列化。
 func (that *RedisStore) SetRaw(ctx context.Context, key string, data []byte, ttl time.Duration) error {
+	ctx, done, err := that.pool.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	return that.pool.SelectRedis(that.useGlobal).Set(ctx, key, data, ttl).Err()
 }
 

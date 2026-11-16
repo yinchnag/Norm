@@ -97,6 +97,7 @@ func (that *flushQueue) backoff(item *pendingItem, retryAt time.Time) {
 // 架构：N 个 worker goroutine，每隔 FlushInterval 批量执行 UPSERT/软删除。
 // 提交操作：调用 EnqueueSave/EnqueueDelete 仅将快照入队，不阻塞游戏逻辑。
 type MySQLStore struct {
+	admission     sync.Mutex
 	pool          *Pool
 	useGlobal     bool
 	queues        []*flushQueue
@@ -236,7 +237,12 @@ func (that *MySQLStore) start() {
 // 重复调用是安全的。
 func (that *MySQLStore) Stop() {
 	that.stopOnce.Do(func() {
+		if that.pool != nil {
+			that.pool.stopWrites()
+		}
+		that.admission.Lock()
 		that.stopped.Store(true)
+		that.admission.Unlock()
 		close(that.stopCh)
 		that.wg.Wait()
 		that.reportUnflushed()
@@ -434,9 +440,13 @@ func (that *MySQLStore) EnqueueSave(tableName string, meta *TableMeta, base unsa
 func (that *MySQLStore) EnqueueSaveSnapshot(tableName string, meta *TableMeta, snap []any) {
 	frozenMeta := freezeTableMeta(meta)
 	pk := snap[pkIndex(frozenMeta)]
-	if that.rejectIfStopped(tableName, frozenMeta, snap, false) {
+	that.admission.Lock()
+	if that.stopped.Load() {
+		that.admission.Unlock()
+		that.rejectIfStopped(tableName, frozenMeta, snap, false)
 		return
 	}
+	defer that.admission.Unlock()
 	key := fmt.Sprintf("%s:%v", tableName, pk)
 	idx := hashKey(key) % uint64(that.nWorker)
 	that.queues[idx].push(&pendingItem{
@@ -452,9 +462,13 @@ func (that *MySQLStore) EnqueueDelete(tableName string, meta *TableMeta, base un
 	frozenMeta := freezeTableMeta(meta)
 	snap := snapshotFields(frozenMeta, base)
 	pk := snap[pkIndex(frozenMeta)]
-	if that.rejectIfStopped(tableName, frozenMeta, snap, true) {
+	that.admission.Lock()
+	if that.stopped.Load() {
+		that.admission.Unlock()
+		that.rejectIfStopped(tableName, frozenMeta, snap, true)
 		return
 	}
+	defer that.admission.Unlock()
 	key := fmt.Sprintf("%s:%v", tableName, pk)
 	idx := hashKey(key) % uint64(that.nWorker)
 	that.queues[idx].push(&pendingItem{
@@ -543,6 +557,9 @@ func pkIndex(meta *TableMeta) int {
 // 若 worker 从未启动（未调用过 Save/Delete），此函数为空操作。
 // 调用后 MySQLStore 停止，不可再次提交写入请求。
 func Shutdown() {
+	if globalPool != nil {
+		globalPool.stopWrites()
+	}
 	if globalMySQLStore != nil {
 		globalMySQLStore.Stop()
 	}

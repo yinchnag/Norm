@@ -161,9 +161,13 @@ func (that *TableSchema[T]) Init() {
 
 // Save 将宿主对象写入 Redis（同步）并提交 MySQL 异步存盘请求（不阻塞）。
 // 多次调用时，新的存盘请求会覆盖队列中尚未执行的旧请求，以减少 MySQL 写入次数。
-func (that *TableSchema[T]) Save() {
+func (that *TableSchema[T]) Save() error {
 	that.mustInit()
-	ctx := context.Background()
+	ctx, done, err := GetPool().beginWrite(context.Background())
+	if err != nil {
+		return withContext("Save", that.meta.TableName, nil, nil, err)
+	}
+	defer done()
 	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
 	useGlobal := that.useGlobalStorage()
 
@@ -179,14 +183,19 @@ func (that *TableSchema[T]) Save() {
 
 	// 2. 异步入队 MySQL 存盘（不阻塞游戏逻辑）
 	getMySQLStoreForRoute(useGlobal).EnqueueSaveSnapshot(that.meta.TableName, that.meta, snap)
+	return nil
 }
 
 // SaveR 仅将宿主对象写入 Redis，不提交 MySQL 异步存盘。
 // 适用于临时态/会话态等无需落盘 MySQL 的数据。
-func (that *TableSchema[T]) SaveR() {
+func (that *TableSchema[T]) SaveR() error {
 	that.mustInit()
 
-	ctx := context.Background()
+	ctx, done, err := GetPool().beginWrite(context.Background())
+	if err != nil {
+		return withContext("SaveR", that.meta.TableName, nil, nil, err)
+	}
+	defer done()
 	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
 	useGlobal := that.useGlobalStorage()
 
@@ -200,6 +209,7 @@ func (that *TableSchema[T]) SaveR() {
 		fmt.Printf("[gameorm] SaveR redis error [%s:%v]: %v\n",
 			that.meta.TableName, pk, err)
 	}
+	return nil
 }
 
 // Load 按主键从 Redis 读取对象；Redis 未命中时降级读 MySQL，并回写 Redis。
@@ -276,9 +286,13 @@ func (that *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *Redi
 }
 
 // Delete 软删除：Redis 删除缓存 + MySQL 异步设置 is_deleted=1。
-func (that *TableSchema[T]) Delete() {
+func (that *TableSchema[T]) Delete() error {
 	that.mustInit()
-	ctx := context.Background()
+	ctx, done, err := GetPool().beginWrite(context.Background())
+	if err != nil {
+		return withContext("Delete", that.meta.TableName, nil, nil, err)
+	}
+	defer done()
 	pk := ReadPrimaryKey(that.selfPtr, that.meta.PrimaryField)
 	useGlobal := that.useGlobalStorage()
 
@@ -288,6 +302,7 @@ func (that *TableSchema[T]) Delete() {
 	}
 	// 2. 异步软删除 MySQL
 	getMySQLStoreForRoute(useGlobal).EnqueueDelete(that.meta.TableName, that.meta, that.selfPtr)
+	return nil
 }
 
 // FindAll 等效于 NewQueryBuilder[T].Where(cond).OrderBy(orderBy).Limit(limit).FindAll(ctx)。

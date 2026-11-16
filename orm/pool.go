@@ -12,6 +12,7 @@ import (
 
 // Pool 持有 MySQL 和 Redis 连接池的全局单例，由 InitPool 初始化。
 type Pool struct {
+	writes      writeLifecycle
 	DB          *sql.DB
 	Redis       *goredis.Client
 	GlobalDB    *sql.DB
